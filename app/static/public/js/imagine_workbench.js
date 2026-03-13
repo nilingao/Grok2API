@@ -1870,29 +1870,7 @@
     });
   }
 
-  function mountInlineSubmitButton() {
-    if (!editPromptInput || !submitEditBtn) return false;
-    const promptWrap = editPromptInput.closest('.prompt-enhance-wrap');
-    if (!promptWrap) return false;
-    if (!promptWrap.contains(submitEditBtn)) {
-      const actionRow = submitEditBtn.parentElement;
-      promptWrap.appendChild(submitEditBtn);
-      if (actionRow && actionRow.classList && actionRow.classList.contains('action-row')) {
-        actionRow.classList.add('action-row-inline');
-      }
-    }
-    submitEditBtn.classList.add('inline-submit-btn');
-    return true;
-  }
-
-  function ensureInlineSubmitButton(attempt = 0) {
-    if (mountInlineSubmitButton()) return;
-    if (attempt >= 20) return;
-    setTimeout(() => ensureInlineSubmitButton(attempt + 1), 50);
-  }
-
   function init() {
-    ensureInlineSubmitButton();
     bindEvents();
     syncPromptRichInputFromTextarea();
     renderReferenceStrip();
