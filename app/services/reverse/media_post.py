@@ -443,6 +443,18 @@ class MediaPostReverse:
                         pass
                     if len(content) > 300:
                         content = f"{content[:300]}...(len={len(content)})"
+                    if response.status_code == 404:
+                        logger.warning(
+                            "MediaPostReverse: Media post create-link not found, skip. status={}, body={}",
+                            response.status_code,
+                            content or "-",
+                        )
+                        # 404 is expected for non-shareable/non-post ids in metadata probe flow.
+                        return MediaPostReverse._SimpleResponse(
+                            status_code=200,
+                            headers={},
+                            text="{}",
+                        )
                     logger.error(
                         "MediaPostReverse: Media post create-link failed, status={}, body={}",
                         response.status_code,
