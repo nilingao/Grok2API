@@ -160,6 +160,40 @@ def _normalize_fallback_image_url(url: str) -> str:
     return f"https://assets.grok.com/{raw}"
 
 
+def _extract_upstream_status_and_body(exc: Exception) -> tuple[int | None, str]:
+    if not isinstance(exc, UpstreamException):
+        return None, ""
+    details = getattr(exc, "details", None) or {}
+    status = details.get("status")
+    if status is None:
+        status = getattr(exc, "status_code", None)
+    try:
+        status = int(status) if status is not None else None
+    except (TypeError, ValueError):
+        status = None
+    body = str(details.get("body") or "").strip()
+    return status, body
+
+
+def _is_parent_post_retryable_400(exc: Exception) -> bool:
+    status, body = _extract_upstream_status_and_body(exc)
+    if status != 400:
+        return False
+    body_lower = body.lower()
+    if not body_lower:
+        return True
+    keywords = (
+        "parentpostid",
+        "parent_post_id",
+        "parent post",
+        "invalid request",
+        "bad request",
+        "image reference",
+        "attachments preprocessing",
+    )
+    return any(key in body_lower for key in keywords)
+
+
 def _build_parent_source_candidates(parent_post_id: str, source_image_url: str) -> List[str]:
     """构建 parentPostId 编辑可复用的图片源候选列表。"""
     candidates: List[str] = []
@@ -658,16 +692,48 @@ class ImageEditService:
                     "已提交编辑请求",
                     parent_post_id=effective_parent_post_id,
                 )
-                images_out = await self._collect_images(
-                    token=current_token,
-                    prompt=prompt,
-                    model_info=model_info,
-                    response_format=response_format,
-                    tool_overrides=tool_overrides,
-                    model_config_override=model_config_override,
-                    return_all_images=return_all_images,
-                    progress_cb=progress_cb,
-                )
+                try:
+                    images_out = await self._collect_images(
+                        token=current_token,
+                        prompt=prompt,
+                        model_info=model_info,
+                        response_format=response_format,
+                        tool_overrides=tool_overrides,
+                        model_config_override=model_config_override,
+                        return_all_images=return_all_images,
+                        progress_cb=progress_cb,
+                    )
+                except Exception as collect_error:
+                    if not _is_parent_post_retryable_400(collect_error):
+                        raise
+                    logger.warning(
+                        "Image edit(parentPostId) got 400, fallback to reference-only retry: "
+                        f"parent_post_id={effective_parent_post_id}, image_ref={image_ref}"
+                    )
+                    await self._emit_progress(
+                        progress_cb,
+                        "parent_post_fallback",
+                        56,
+                        "parentPostId 请求失败，自动切换参考图重试",
+                    )
+                    fallback_config = {
+                        "modelMap": {
+                            "imageEditModel": "imagine",
+                            "imageEditModelConfig": {
+                                "imageReferences": [image_ref],
+                            },
+                        }
+                    }
+                    images_out = await self._collect_images(
+                        token=current_token,
+                        prompt=prompt,
+                        model_info=model_info,
+                        response_format=response_format,
+                        tool_overrides=tool_overrides,
+                        model_config_override=fallback_config,
+                        return_all_images=return_all_images,
+                        progress_cb=progress_cb,
+                    )
                 await self._emit_progress(
                     progress_cb,
                     "collect_done",

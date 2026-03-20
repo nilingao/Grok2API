@@ -242,7 +242,9 @@ class AppChatReverse:
                         extra={"error_type": "UpstreamException"},
                     )
                     logger.error(f"Response Headers: {response.headers}")
-                    logger.error(f"Response Body: {content}")
+                    logger.error(
+                        f"Response Body(len={len(content)}): {content[:800]!r}"
+                    )
                     raise UpstreamException(
                         message=f"AppChatReverse: Chat failed, {response.status_code}",
                         details={"status": response.status_code, "body": content},
