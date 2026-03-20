@@ -1,4 +1,5 @@
 import asyncio
+import re
 
 import orjson
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -13,7 +14,6 @@ from app.services.grok.batch_services.nsfw import NSFWService
 from app.services.token.manager import get_token_manager
 
 router = APIRouter()
-
 
 _TOKEN_CHAR_REPLACEMENTS = str.maketrans(
     {
