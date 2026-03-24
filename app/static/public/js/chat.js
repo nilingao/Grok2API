@@ -38,6 +38,8 @@
   let followStreamScroll = true;
   let suppressScrollTracking = false;
   let userLockedStreamScroll = false;
+  const activeThinkSpinEntries = new Set();
+  let thinkSpinRafId = 0;
   const feedbackUrl = 'https://github.com/chenyme/grok2api/issues/new';
   const STORAGE_KEY = 'grok2api_chat_sessions';
   const SIDEBAR_STATE_KEY = 'grok2api_chat_sidebar_collapsed';
@@ -1168,7 +1170,7 @@
         }).join('');
         const title = escapeHtml(group.id);
         const openAttr = openAllGroups ? ' open' : '';
-        return `<details class="think-rollout-group"${openAttr}><summary><span class="think-rollout-title">${title}</span></summary><div class="think-rollout-body">${items}</div></details>`;
+        return `<details class="think-rollout-group"${openAttr}><summary><span class="think-rollout-title"><span class="think-rollout-avatar" aria-hidden="true"></span><span class="think-rollout-label">${title}</span></span></summary><div class="think-rollout-body">${items}</div></details>`;
       }).join('');
     };
 
@@ -1619,17 +1621,41 @@
       if (!entry.thinkingActive) {
         block.removeAttribute('data-thinking');
         node.style.removeProperty('--think-spin-delay');
-        block.querySelectorAll('.think-agent-avatar').forEach((avatar) => {
-          avatar.style.removeProperty('--think-spin-delay');
+        activeThinkSpinEntries.delete(entry);
+        block.querySelectorAll('.think-agent-avatar, .think-rollout-avatar').forEach((avatar) => {
+          avatar.style.removeProperty('transform');
         });
       } else {
         block.setAttribute('data-thinking', 'true');
         node.style.setProperty('--think-spin-delay', spinOffset);
-        block.querySelectorAll('.think-agent-avatar').forEach((avatar) => {
-          avatar.style.setProperty('--think-spin-delay', spinOffset);
-        });
+        activeThinkSpinEntries.add(entry);
+        ensureThinkSpinLoop();
       }
     });
+  }
+
+  function ensureThinkSpinLoop() {
+    if (thinkSpinRafId) return;
+    const tick = () => {
+      thinkSpinRafId = 0;
+      if (!activeThinkSpinEntries.size) return;
+      const now = Date.now();
+      activeThinkSpinEntries.forEach((entry) => {
+        if (!entry || !entry.contentNode || !entry.thinkingActive || !entry.contentNode.isConnected) {
+          activeThinkSpinEntries.delete(entry);
+          return;
+        }
+        const elapsedMs = Math.max(0, now - (entry.startedAt || now));
+        const angle = ((elapsedMs % 2200) / 2200) * 360;
+        entry.contentNode.querySelectorAll('.think-block[data-thinking="true"] .think-agent-avatar, .think-block[data-thinking="true"] .think-rollout-avatar').forEach((avatar) => {
+          avatar.style.transform = `rotate(${angle}deg)`;
+        });
+      });
+      if (activeThinkSpinEntries.size) {
+        thinkSpinRafId = requestAnimationFrame(tick);
+      }
+    };
+    thinkSpinRafId = requestAnimationFrame(tick);
   }
 
   function normalizeSourceText(value) {

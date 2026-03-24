@@ -685,16 +685,6 @@ body {
   animation-delay: var(--think-spin-delay, 0s);
 }
 
-.think-block[data-thinking="true"] .think-agent-avatar {
-  animation: thinkSpinSlow 2.2s linear infinite;
-  animation-delay: var(--think-spin-delay, 0s);
-}
-
-.think-block[data-thinking="true"] .think-rollout-title::before {
-  animation: thinkSpinSlow 2.2s linear infinite;
-  animation-delay: var(--think-spin-delay, 0s);
-}
-
 .think-summary::after {
   content: "";
   width: 6px;
@@ -971,14 +961,23 @@ body {
   gap: 8px;
 }
 
-.think-rollout-title::before {
-  content: "";
+.think-rollout-avatar {
   width: 18px;
   height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 18px;
   border-radius: 50%;
   background: conic-gradient(from 180deg, #f59e0b, #f97316, #22c55e, #0ea5e9, #f59e0b);
   border: 1px solid #fff;
   box-shadow: 0 2px 8px rgba(17, 17, 17, 0.15);
+}
+
+.think-rollout-label {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
 }
 
 .think-rollout-body {
