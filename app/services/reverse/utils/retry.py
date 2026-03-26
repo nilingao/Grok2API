@@ -221,7 +221,10 @@ async def retry_on_status(
                         f"last status: {status_code}, total delay: {ctx.total_delay:.2f}s"
                     )
                 else:
-                    logger.error(f"Non-retryable status code: {status_code}")
+                    if status_code == 404:
+                        logger.warning(f"Non-retryable status code: {status_code}")
+                    else:
+                        logger.error(f"Non-retryable status code: {status_code}")
 
                 # Raise last failed exception
                 raise
