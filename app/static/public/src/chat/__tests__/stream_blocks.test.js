@@ -36,6 +36,15 @@ describe('renderLiteMarkdown', () => {
     expect(html).not.toContain('&lt;think&gt;');
   });
 
+  it('流式阶段保留多 agent 思考块样式结构', () => {
+    const html = renderLiteMarkdown('<think>\\n[Agent 1][WebSearch] Tesla Model Y\\nbrowse_page {"url":"https://example.com"}\\n[Agent 2][SearchImage] Tesla Model Y exterior\\n');
+    expect(html).toContain('class="think-agents"');
+    expect(html).toContain('class="think-agent"');
+    expect(html).toContain('class="think-agent-items"');
+    expect(html).toContain('class="think-item-row"');
+    expect(html).toContain('browse_page');
+  });
+
   it('轻量渲染支持 markdown 图片语法', () => {
     const html = renderLiteMarkdown('![demo](https://example.com/demo.png)');
     expect(html).toContain('class="message-image-card');

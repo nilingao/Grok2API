@@ -2495,6 +2495,91 @@
     }
     return parts;
   }
+  function parseRolloutBlocksLite(text, defaultId = "General") {
+    const lines = String(text || "").split(/\r?\n/);
+    const blocks = [];
+    let current = null;
+    for (const line of lines) {
+      const matchDouble = line.match(/^\s*\[([^\]]+)\]\[([^\]]+)\]\s*(.*)$/);
+      if (matchDouble) {
+        if (current) blocks.push(current);
+        current = { id: matchDouble[1], type: matchDouble[2], lines: [] };
+        if (matchDouble[3]) current.lines.push(matchDouble[3]);
+        continue;
+      }
+      const matchSingle = line.match(/^\s*\[([^\]]+)\]\s*(.*)$/);
+      if (matchSingle) {
+        const maybeType = String(matchSingle[1] || "").trim();
+        if (/^(WebSearch|SearchImage|AgentThink)$/i.test(maybeType)) {
+          if (current) blocks.push(current);
+          current = { id: defaultId || "General", type: maybeType, lines: [] };
+          if (matchSingle[2]) current.lines.push(matchSingle[2]);
+          continue;
+        }
+      }
+      if (current && /^\s*\[[^\]]+\]\s*$/.test(line)) {
+        continue;
+      }
+      if (current) {
+        current.lines.push(line);
+      }
+    }
+    if (current) blocks.push(current);
+    return blocks;
+  }
+  function parseAgentSectionsLite(text) {
+    const lines = String(text || "").split(/\r?\n/);
+    const sections = [];
+    let current = { title: null, lines: [] };
+    let hasAgentHeading = false;
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) {
+        current.lines.push(line);
+        continue;
+      }
+      const agentMatch = trimmed.match(/^(Grok\s+Leader|(?:Grok\s+)?Agent\s*\d+)$/i);
+      if (agentMatch) {
+        hasAgentHeading = true;
+        if (current.lines.length) {
+          sections.push(current);
+        }
+        current = { title: agentMatch[1], lines: [] };
+        continue;
+      }
+      current.lines.push(line);
+    }
+    if (current.lines.length) {
+      sections.push(current);
+    }
+    if (!hasAgentHeading) {
+      return [{ title: null, lines }];
+    }
+    return sections;
+  }
+  function splitBlocksIntoSyntheticAgentsLite(blocks) {
+    const list = Array.isArray(blocks) ? blocks : [];
+    if (!list.length) return [];
+    const ids = Array.from(new Set(list.map((block) => String(block.id || "").trim()).filter(Boolean)));
+    const nonGeneralIds = ids.filter((id) => !/^general$/i.test(id));
+    if (nonGeneralIds.length <= 1) return [];
+    const groups = [];
+    const groupMap = /* @__PURE__ */ new Map();
+    for (const block of list) {
+      const key = String(block.id || "General");
+      let group = groupMap.get(key);
+      if (!group) {
+        group = { key, blocks: [] };
+        groupMap.set(key, group);
+        groups.push(group);
+      }
+      group.blocks.push(block);
+    }
+    return groups.map((group, index) => ({
+      title: index === 0 ? "Grok Leader" : `Agent ${index}`,
+      blocks: group.blocks
+    }));
+  }
   function renderLiteLine(line) {
     const trimmed = line.trimEnd();
     if (!trimmed) return "";
@@ -2533,13 +2618,71 @@
       return `<div class="stream-lite-paragraph">${lines.join("")}</div>`;
     }).filter(Boolean).join("");
   }
+  function renderThinkItemRowsLite(blocks, options = {}) {
+    return (Array.isArray(blocks) ? blocks : []).map((item) => {
+      const typeText = escapeHtml(String(item && item.type || ""));
+      const typeKey = String(item && item.type || "").trim().toLowerCase().replace(/\s+/g, "");
+      const body = renderLiteBody((item && item.lines ? item.lines.join("\n") : "").trim(), options);
+      return `<div class="think-item-row"><div class="think-item-type" data-type="${escapeHtml(typeKey)}">${typeText}</div><div class="think-item-body">${body || "<em>\uFF08\u7A7A\uFF09</em>"}</div></div>`;
+    }).join("");
+  }
+  function renderThinkLiteContent(text, openAll, options = {}) {
+    const sections = parseAgentSectionsLite(text);
+    if (!sections.length) {
+      return renderLiteBody(text, options);
+    }
+    const renderThinkAgentSummary = (title) => {
+      const safeTitle = escapeHtml(String(title || ""));
+      return `<summary><span class="think-agent-avatar" aria-hidden="true"></span><span class="think-agent-label">${safeTitle}</span></summary>`;
+    };
+    const renderGroups = (blocks) => {
+      const groups = [];
+      const groupMap = /* @__PURE__ */ new Map();
+      for (const block of blocks) {
+        const key = String(block.id || "General");
+        let group = groupMap.get(key);
+        if (!group) {
+          group = { id: key, items: [] };
+          groupMap.set(key, group);
+          groups.push(group);
+        }
+        group.items.push(block);
+      }
+      return groups.map((group) => {
+        const title = escapeHtml(group.id);
+        const openAttr = openAll ? " open" : "";
+        const items = renderThinkItemRowsLite(group.items, options);
+        return `<details class="think-rollout-group"${openAttr}><summary><span class="think-rollout-title"><span class="think-rollout-avatar" aria-hidden="true"></span><span class="think-rollout-label">${title}</span></span></summary><div class="think-rollout-body">${items || "<em>\uFF08\u7A7A\uFF09</em>"}</div></details>`;
+      }).join("");
+    };
+    const agentBlocks = sections.map((section, index) => {
+      const blocks = parseRolloutBlocksLite(section.lines.join("\n"), section.title || "General");
+      if (!section.title && blocks.length) {
+        const syntheticAgents = splitBlocksIntoSyntheticAgentsLite(blocks);
+        if (syntheticAgents.length) {
+          return syntheticAgents.map((agent, agentIndex) => {
+            const openAttr2 = openAll ? " open" : index === 0 && agentIndex === 0 ? " open" : "";
+            const inner2 = renderThinkItemRowsLite(agent.blocks, options);
+            return `<details class="think-agent"${openAttr2}>${renderThinkAgentSummary(agent.title)}<div class="think-agent-items">${inner2}</div></details>`;
+          }).join("");
+        }
+      }
+      const inner = blocks.length ? renderGroups(blocks) : `<div class="think-rollout-body">${renderLiteBody(section.lines.join("\n").trim(), options) || "<em>\uFF08\u7A7A\uFF09</em>"}</div>`;
+      if (!section.title) {
+        return `<div class="think-agent-items">${inner}</div>`;
+      }
+      const openAttr = openAll ? " open" : index === 0 ? " open" : "";
+      return `<details class="think-agent"${openAttr}>${renderThinkAgentSummary(section.title)}<div class="think-agent-items">${inner}</div></details>`;
+    });
+    return `<div class="think-agents">${agentBlocks.join("")}</div>`;
+  }
   function renderLiteMarkdown(text, options = {}) {
     const source = String(text || "").replace(/\\n/g, "\n");
     if (!source.trim()) return "";
     const parts = parseThinkLiteSections(source);
     return parts.map((part) => {
       if (part.type === "think") {
-        const body = renderLiteBody(part.value, options);
+        const body = renderThinkLiteContent(part.value.trim(), part.open, options);
         const openAttr = part.open ? " open" : "";
         return `<details class="think-block" data-think="true"${openAttr}><summary class="think-summary">\u601D\u8003\u4E2D</summary><div class="think-content">${body || "<em>\uFF08\u7A7A\uFF09</em>"}</div></details>`;
       }
