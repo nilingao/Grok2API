@@ -1065,7 +1065,7 @@ class VideoService:
         if is_custom:
             mode = "custom"
         else:
-            mode = VideoService._map_preset_to_mode(preset)
+            mode = "normal"
             prompt_text = ""
 
         effective_original = (original_post_id or "").strip() or extend_post_id
@@ -1290,7 +1290,7 @@ class VideoService:
 
                 # Generate video.
                 service = VideoService()
-                if extend_post_id and video_extension_start_time is not None:
+                if extend_post_id:
                     # 视频延长路径
                     response = await service.generate_extend_video(
                         token=token,

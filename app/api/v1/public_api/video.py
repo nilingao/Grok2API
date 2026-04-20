@@ -391,8 +391,8 @@ async def public_video_start(data: VideoStartRequest):
                 status_code=400,
                 detail="extend_post_id is required for video extension",
             )
-        if video_extension_start_time is not None and video_extension_start_time <= 0:
-            video_extension_start_time = None
+        if video_extension_start_time is None or video_extension_start_time <= 0:
+            video_extension_start_time = 6.0
 
         logger.info(
             "Public video extension request: "
