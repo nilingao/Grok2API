@@ -61,6 +61,8 @@ class AppChatReverse:
         model_config_override: Dict[str, Any] = None,
         image_generation_count: int | None = None,
         request_overrides: Dict[str, Any] | None = None,
+        omit_file_attachments: bool = False,
+        minimal_payload: bool = False,
     ) -> Dict[str, Any]:
         """Build chat payload for Grok app-chat API."""
 
@@ -72,6 +74,29 @@ class AppChatReverse:
             and "imageGenerationCount" not in resolved_request_overrides
         ):
             resolved_request_overrides["imageGenerationCount"] = image_generation_count
+
+        if minimal_payload:
+            payload = {
+                "temporary": get_config("app.temporary"),
+                "modelName": model,
+                "message": message,
+                "toolOverrides": tool_overrides or {},
+                "enableSideBySide": True,
+                "responseMetadata": {
+                    "experiments": [],
+                },
+            }
+            if model_config_override:
+                payload["responseMetadata"]["modelConfigOverride"] = model_config_override
+            if (not omit_file_attachments) and attachments:
+                payload["fileAttachments"] = attachments
+            if model == "grok-420":
+                payload["enable420"] = True
+                if mode:
+                    payload["modeId"] = mode
+            elif mode:
+                payload["modelMode"] = mode
+            return payload
 
         payload = {
             "deviceEnvInfo": {
@@ -99,6 +124,7 @@ class AppChatReverse:
             "message": message,
             "modelName": model,
             "responseMetadata": {
+                "experiments": [],
                 "requestModelDetails": {"modelId": model},
             },
             "returnImageBytes": False,
@@ -110,6 +136,9 @@ class AppChatReverse:
 
         if model_config_override:
             payload["responseMetadata"]["modelConfigOverride"] = model_config_override
+
+        if omit_file_attachments:
+            payload.pop("fileAttachments", None)
 
         if model == "grok-420":
             payload["enable420"] = True
@@ -143,6 +172,8 @@ class AppChatReverse:
         model_config_override: Dict[str, Any] = None,
         image_generation_count: int | None = None,
         request_overrides: Dict[str, Any] | None = None,
+        omit_file_attachments: bool = False,
+        minimal_payload: bool = False,
     ) -> Any:
         """Send app chat request to Grok.
         
@@ -183,6 +214,8 @@ class AppChatReverse:
                 model_config_override=model_config_override,
                 image_generation_count=image_generation_count,
                 request_overrides=request_overrides,
+                omit_file_attachments=omit_file_attachments,
+                minimal_payload=minimal_payload,
             )
             logger.info(
                 "AppChat request prepared: "
