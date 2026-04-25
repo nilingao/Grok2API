@@ -405,12 +405,12 @@ class TokenManager:
             usage_service = UsageService()
             result = await usage_service.get(token_str)
 
-            if result and "remainingTokens" in result:
+            new_quota = None
+            if result:
                 new_quota = result.get("remainingTokens")
                 if new_quota is None:
                     new_quota = result.get("remainingQueries")
-                if new_quota is None:
-                    return False
+            if new_quota is not None:
                 old_quota = target_token.primary_quota()
 
                 target_token.update_quota(new_quota)
@@ -797,12 +797,12 @@ class TokenManager:
                         synced = await self.sync_usage_windows(token_str, is_usage=False)
                         if not synced:
                             result = await usage_service.get(token_str)
-                            if result and "remainingTokens" in result:
+                            new_quota = None
+                            if result:
                                 new_quota = result.get("remainingTokens")
                                 if new_quota is None:
                                     new_quota = result.get("remainingQueries")
-                                if new_quota is None:
-                                    return {"recovered": False, "expired": False}
+                            if new_quota is not None:
                                 token_info.update_quota(new_quota)
                                 token_info.mark_synced()
                                 logger.info(

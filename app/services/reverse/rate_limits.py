@@ -31,7 +31,7 @@ class RateLimitsReverse:
         session: AsyncSession,
         token: str,
         *,
-        model_name: str = "grok-4-1-thinking-1129",
+        model_name: str = "auto",
     ) -> Any:
         """Fetch rate limits from Grok.
 
