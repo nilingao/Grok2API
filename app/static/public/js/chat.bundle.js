@@ -29,15 +29,16 @@
         const parsed = new URL(raw, window.location.origin);
         const host = String(parsed.hostname || "").toLowerCase();
         const path = String(parsed.pathname || "").trim();
-        const marker = "/v1/files/image/";
-        if (path.includes(marker)) {
+        const fileMarkers = ["/v1/files/asset/", "/v1/files/image/", "/v1/files/video/", "/v1/files/file/"];
+        const marker = fileMarkers.find((item) => path.includes(item));
+        if (marker) {
           return path.slice(path.indexOf(marker));
         }
         if (host === "localhost" || host === "127.0.0.1") {
           return path || "";
         }
         if (host === "assets.grok.com" && path) {
-          return `/v1/files/image${path.startsWith("/") ? path : `/${path}`}`;
+          return `/v1/files/asset${path.startsWith("/") ? path : `/${path}`}`;
         }
         return raw;
       } catch (error) {
@@ -45,6 +46,12 @@
       }
     }
     const basePath = raw.startsWith("/") ? raw : `/${raw}`;
+    if (basePath.startsWith("/v1/files/asset/") || basePath.startsWith("/v1/files/image/") || basePath.startsWith("/v1/files/video/") || basePath.startsWith("/v1/files/file/")) {
+      return basePath;
+    }
+    if (basePath.startsWith("/users/")) {
+      return `/v1/files/asset${basePath}`;
+    }
     return basePath.startsWith("/v1/files/image/") ? basePath : `/v1/files/image${basePath}`;
   }
   function parseRenderingCards(rendering) {
@@ -65,11 +72,11 @@
   function buildCardItem(card, fallbackKey = "") {
     const image = card && card.image && typeof card.image === "object" ? card.image : null;
     const chunk = card && card.image_chunk && typeof card.image_chunk === "object" ? card.image_chunk : null;
-    const rawSrc = String(image && (image.original || image.link || image.thumbnail) || chunk && chunk.imageUrl || "").trim();
+    const rawSrc = String(image && (image.original || image.thumbnail) || chunk && chunk.imageUrl || "").trim();
     const src = normalizeMediaUrl(rawSrc);
     if (!src) return null;
     const sourceHref = normalizeHttpUrl(image && (image.link || image.original) || "");
-    const fallbackSrc = String(image && image.thumbnail || "").trim();
+    const fallbackSrc = normalizeMediaUrl(image && image.thumbnail || "");
     const caption = normalizeSourceText(image && image.title || chunk && chunk.imageTitle || "");
     return {
       key: card && card.id ? `card:${card.id}` : fallbackKey || `url:${src}`,
@@ -82,13 +89,51 @@
       fallbackSrc
     };
   }
+  function getFileKind(mime, contentType) {
+    const normalizedMime = String(mime || "").toLowerCase();
+    const normalizedType = String(contentType || "").toLowerCase();
+    if (normalizedMime.startsWith("image/") || normalizedType === "image") return "image";
+    if (normalizedMime.startsWith("video/") || normalizedType === "video") return "video";
+    return "file";
+  }
+  function buildFileItem(file, fallbackKey = "") {
+    if (!file || typeof file !== "object") return null;
+    const rawSrc = String(file.url || file.href || "").trim();
+    const src = normalizeMediaUrl(rawSrc);
+    if (!src) return null;
+    const name = normalizeSourceText(file.name || file.file_name || "download");
+    const mime = normalizeSourceText(file.mime || file.mime_type || "");
+    const contentType = normalizeSourceText(file.contentType || file.content_type || "");
+    const size = Number(file.size || file.file_size || 0) || 0;
+    const kind = getFileKind(mime, contentType);
+    return {
+      key: fallbackKey || `file:${file.id || name}:${src}`,
+      cardId: file.id ? String(file.id) : "",
+      src,
+      alt: name || "file",
+      caption: name || "",
+      sourceHref: "",
+      sourceLabel: "",
+      fallbackSrc: "",
+      kind,
+      name: name || "download",
+      mime,
+      contentType,
+      size
+    };
+  }
   function buildMediaItems(rendering) {
     if (!rendering || typeof rendering !== "object") return [];
     const items = [];
     const seen = /* @__PURE__ */ new Set();
+    const seenSrc = /* @__PURE__ */ new Set();
+    const files = Array.isArray(rendering.files) ? rendering.files : [];
+    const hasExplicitFiles = files.length > 0;
     const pushItem = (item) => {
       if (!item || !item.key || seen.has(item.key)) return;
+      if (item.src && seenSrc.has(item.src)) return;
       seen.add(item.key);
+      if (item.src) seenSrc.add(item.src);
       items.push(item);
     };
     const cardMap = parseRenderingCards(rendering);
@@ -97,7 +142,12 @@
       const cardType = String(card && card.cardType || "");
       if (cType === "render_searched_image" || cType === "render_edited_image" || cType === "render_generated_image" || cardType === "generated_image_card") {
         pushItem(buildCardItem(card));
+      } else if (!hasExplicitFiles && (cType === "render_file" || cardType === "rendered_file_card")) {
+        pushItem(buildFileItem(card, card && card.id ? `file-card:${card.id}` : ""));
       }
+    });
+    files.forEach((file) => {
+      pushItem(buildFileItem(file));
     });
     const extraImages = Array.isArray(rendering.extraImages) ? rendering.extraImages : [];
     extraImages.forEach((url) => {
@@ -2606,7 +2656,7 @@
       const safeUrl = escapeHtml(String(url || "").trim());
       const safeAlt = escapeHtml(String(alt || "image").trim() || "image");
       if (!safeUrl) return "";
-      return `<figure class="message-image-card stream-lite-image-card"><img src="${safeUrl}" alt="${safeAlt}" loading="lazy" referrerpolicy="no-referrer" crossorigin="anonymous"></figure>`;
+      return `<figure class="message-image-card stream-lite-image-card"><img src="${safeUrl}" alt="${safeAlt}" loading="lazy"></figure>`;
     }));
     const normalizedParagraphs = withImages.split(/\n{2,}/);
     return normalizedParagraphs.map((paragraph) => {
@@ -2631,9 +2681,15 @@
     if (!sections.length) {
       return renderLiteBody(text, options);
     }
-    const renderThinkAgentSummary = (title) => {
+    const getThinkAgentBadge = (title, index) => {
+      const match = String(title || "").match(/Agent\s*(\d+)/i);
+      if (match) return match[1];
+      return String(index);
+    };
+    const renderThinkAgentSummary = (title, index) => {
       const safeTitle = escapeHtml(String(title || ""));
-      return `<summary><span class="think-agent-avatar" aria-hidden="true"></span><span class="think-agent-label">${safeTitle}</span></summary>`;
+      const safeBadge = escapeHtml(getThinkAgentBadge(title, index));
+      return `<span class="think-agent-trigger"><span class="think-agent-avatar" aria-hidden="true"><span class="think-agent-number">${safeBadge}</span></span><span class="think-agent-label">${safeTitle}</span></span>`;
     };
     const renderGroups = (blocks) => {
       const groups = [];
@@ -2655,26 +2711,40 @@
         return `<details class="think-rollout-group"${openAttr}><summary><span class="think-rollout-title"><span class="think-rollout-avatar" aria-hidden="true"></span><span class="think-rollout-label">${title}</span></span></summary><div class="think-rollout-body">${items || "<em>\uFF08\u7A7A\uFF09</em>"}</div></details>`;
       }).join("");
     };
-    const agentBlocks = sections.map((section, index) => {
+    const renderAgentCard = (agent, index, isActive = false) => {
+      const activeAttr = isActive ? ' data-active="true"' : "";
+      const safeTitle = escapeHtml(agent.title);
+      const inner = agent.body || "<em>\uFF08\u7A7A\uFF09</em>";
+      return `<div class="think-agent" role="button" tabindex="0" data-agent-index="${index}" aria-label="${safeTitle}" title="${safeTitle}" style="--agent-order: ${index};"${activeAttr}>${renderThinkAgentSummary(agent.title, index)}<template class="think-agent-template">${inner}</template></div>`;
+    };
+    const agentItems = [];
+    sections.forEach((section) => {
       const blocks = parseRolloutBlocksLite(section.lines.join("\n"), section.title || "General");
       if (!section.title && blocks.length) {
         const syntheticAgents = splitBlocksIntoSyntheticAgentsLite(blocks);
         if (syntheticAgents.length) {
-          return syntheticAgents.map((agent, agentIndex) => {
-            const openAttr2 = openAll ? " open" : index === 0 && agentIndex === 0 ? " open" : "";
+          syntheticAgents.forEach((agent) => {
             const inner2 = renderThinkItemRowsLite(agent.blocks, options);
-            return `<details class="think-agent"${openAttr2}>${renderThinkAgentSummary(agent.title)}<div class="think-agent-items">${inner2}</div></details>`;
-          }).join("");
+            agentItems.push({ title: agent.title, body: inner2 });
+          });
+          return;
         }
       }
       const inner = blocks.length ? renderGroups(blocks) : `<div class="think-rollout-body">${renderLiteBody(section.lines.join("\n").trim(), options) || "<em>\uFF08\u7A7A\uFF09</em>"}</div>`;
       if (!section.title) {
-        return `<div class="think-agent-items">${inner}</div>`;
+        agentItems.push({ title: "Grok Leader", body: inner });
+        return;
       }
-      const openAttr = openAll ? " open" : index === 0 ? " open" : "";
-      return `<details class="think-agent"${openAttr}>${renderThinkAgentSummary(section.title)}<div class="think-agent-items">${inner}</div></details>`;
+      agentItems.push({ title: section.title, body: inner });
     });
-    return `<div class="think-agents">${agentBlocks.join("")}</div>`;
+    if (agentItems.length > 4) {
+      const visible = agentItems.slice(0, 4);
+      const hiddenCount = agentItems.length - visible.length;
+      const avatars = visible.map((agent, index) => `<span class="think-agent-stack-avatar" data-agent-index="${index}" title="${escapeHtml(agent.title)}" aria-hidden="true"><span class="think-agent-number">${escapeHtml(getThinkAgentBadge(agent.title, index))}</span></span>`).join("");
+      const cards = agentItems.map((agent, index) => renderAgentCard(agent, index, false)).join("");
+      return `<div class="think-agent-stack"><button type="button" class="think-agent-stack-toggle" aria-label="\u5C55\u5F00\u4EE3\u7406\u601D\u8003"><span class="think-agent-stack-avatars">${avatars}<span class="think-agent-stack-more">+${hiddenCount}</span></span></button><div class="think-agents">${cards}</div><button type="button" class="think-agent-stack-label">\u4EE3\u7406\u601D\u8003</button></div>`;
+    }
+    return `<div class="think-agents">${agentItems.map((agent, index) => renderAgentCard(agent, index, false)).join("")}</div>`;
   }
   function renderLiteMarkdown(text, options = {}) {
     const source = String(text || "").replace(/\\n/g, "\n");
@@ -2731,6 +2801,27 @@
   }
 
   // app/static/public/src/chat/stream_renderer.js
+  function formatFileSize(size) {
+    const value = Number(size || 0);
+    if (!Number.isFinite(value) || value <= 0) return "";
+    const units = ["B", "KB", "MB", "GB"];
+    let current = value;
+    let index = 0;
+    while (current >= 1024 && index < units.length - 1) {
+      current /= 1024;
+      index += 1;
+    }
+    const digits = current >= 10 || index === 0 ? 0 : 1;
+    return `${current.toFixed(digits)} ${units[index]}`;
+  }
+  function fileIconLabel(item) {
+    const mime = String(item.mime || "").toLowerCase();
+    const name = String(item.name || item.alt || "").toLowerCase();
+    if (mime.includes("zip") || name.endsWith(".zip")) return "ZIP";
+    if (mime.startsWith("video/")) return "MP4";
+    if (mime.startsWith("image/")) return "IMG";
+    return "FILE";
+  }
   function syncMediaCardNode(node, item) {
     node.dataset.mediaKey = item.key;
     node.classList.remove("is-broken");
@@ -2739,10 +2830,10 @@
     if (!(img instanceof HTMLImageElement)) {
       img = document.createElement("img");
       img.loading = "lazy";
-      img.referrerPolicy = "no-referrer";
-      img.crossOrigin = "anonymous";
       node.insertBefore(img, node.firstChild);
     }
+    img.removeAttribute("referrerpolicy");
+    img.removeAttribute("crossorigin");
     if (img.getAttribute("src") !== item.src) {
       img.setAttribute("src", item.src);
     }
@@ -2793,6 +2884,64 @@
     const card = document.createElement("figure");
     card.className = "message-image-card";
     syncMediaCardNode(card, item);
+    return card;
+  }
+  function syncVideoCardNode(node, item) {
+    node.dataset.mediaKey = item.key;
+    node.className = "message-file-card message-video-card";
+    node.replaceChildren();
+    const video = document.createElement("video");
+    video.className = "message-file-video";
+    video.controls = true;
+    video.preload = "metadata";
+    video.playsInline = true;
+    video.src = item.src;
+    const meta = document.createElement("div");
+    meta.className = "message-file-meta";
+    const name = document.createElement("div");
+    name.className = "message-file-name";
+    name.textContent = item.name || item.alt || "video";
+    const sub = document.createElement("div");
+    sub.className = "message-file-sub";
+    sub.textContent = [item.mime || "video", formatFileSize(item.size)].filter(Boolean).join(" \xB7 ");
+    const link = document.createElement("a");
+    link.className = "message-file-download";
+    link.href = item.src;
+    link.download = item.name || "video.mp4";
+    link.textContent = "\u4E0B\u8F7D";
+    meta.append(name, sub, link);
+    node.append(video, meta);
+  }
+  function syncFileCardNode(node, item) {
+    node.dataset.mediaKey = item.key;
+    node.className = "message-file-card";
+    node.replaceChildren();
+    const icon = document.createElement("div");
+    icon.className = "message-file-icon";
+    icon.textContent = fileIconLabel(item);
+    const body = document.createElement("div");
+    body.className = "message-file-body";
+    const name = document.createElement("div");
+    name.className = "message-file-name";
+    name.textContent = item.name || item.alt || "download";
+    const sub = document.createElement("div");
+    sub.className = "message-file-sub";
+    sub.textContent = [item.mime || item.contentType || "file", formatFileSize(item.size)].filter(Boolean).join(" \xB7 ");
+    body.append(name, sub);
+    const link = document.createElement("a");
+    link.className = "message-file-download";
+    link.href = item.src;
+    link.download = item.name || "download";
+    link.textContent = "\u4E0B\u8F7D";
+    node.append(icon, body, link);
+  }
+  function createFileCardNode(item) {
+    const card = document.createElement("figure");
+    if (item.kind === "video") {
+      syncVideoCardNode(card, item);
+    } else {
+      syncFileCardNode(card, item);
+    }
     return card;
   }
   function syncOrderedChildren(parent, desiredNodes) {
@@ -2935,10 +3084,16 @@
     getMediaNode(item) {
       const existing = this.mediaNodeCache.get(item.key);
       if (existing) {
-        syncMediaCardNode(existing, item);
+        if (item.kind === "video") {
+          syncVideoCardNode(existing, item);
+        } else if (item.kind === "file") {
+          syncFileCardNode(existing, item);
+        } else {
+          syncMediaCardNode(existing, item);
+        }
         return existing;
       }
-      const created = createMediaCardNode(item);
+      const created = item.kind === "video" || item.kind === "file" ? createFileCardNode(item) : createMediaCardNode(item);
       this.mediaNodeCache.set(item.key, created);
       return created;
     }
@@ -2993,8 +3148,375 @@
     }
   };
 
+  // app/static/public/src/chat/chat_session_store.js
+  function promisifyRequest(request) {
+    return new Promise((resolve, reject) => {
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error || new Error("IndexedDB \u8BF7\u6C42\u5931\u8D25"));
+    });
+  }
+  function waitForTransaction(transaction) {
+    return new Promise((resolve, reject) => {
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error || new Error("IndexedDB \u4E8B\u52A1\u5931\u8D25"));
+      transaction.onabort = () => reject(transaction.error || new Error("IndexedDB \u4E8B\u52A1\u5DF2\u4E2D\u6B62"));
+    });
+  }
+  function normalizeSessionMeta(session) {
+    if (!session || typeof session !== "object") return null;
+    return {
+      id: String(session.id || ""),
+      title: String(session.title || "\u65B0\u4F1A\u8BDD"),
+      model: String(session.model || ""),
+      grokConversationId: String(session.grokConversationId || ""),
+      grokParentResponseId: String(session.grokParentResponseId || ""),
+      createdAt: Number(session.createdAt || 0) || Date.now(),
+      updatedAt: Number(session.updatedAt || 0) || Date.now(),
+      isDefaultTitle: session.isDefaultTitle !== false,
+      unread: Boolean(session.unread)
+    };
+  }
+  function normalizeStoredMessage(sessionId, message, index = 0) {
+    if (!message || typeof message !== "object") return null;
+    const id = String(message.id || `${sessionId}-message-${index + 1}`);
+    const createdAt = Number(message.createdAt || message.updatedAt || 0) || Date.now();
+    const order = Number(message.order);
+    return {
+      ...message,
+      id,
+      sessionId,
+      createdAt,
+      updatedAt: Number(message.updatedAt || createdAt) || createdAt,
+      order: Number.isFinite(order) ? order : index,
+      role: String(message.role || "assistant")
+    };
+  }
+  function normalizeAttachmentRecord(sessionId, attachment) {
+    if (!attachment || typeof attachment !== "object") return null;
+    const id = String(attachment.id || "");
+    const blob = attachment.blob;
+    if (!id || !(blob instanceof Blob)) return null;
+    const createdAt = Number(attachment.createdAt || 0) || Date.now();
+    return {
+      id,
+      sessionId,
+      name: String(attachment.name || "image"),
+      mime: String(attachment.mime || blob.type || "application/octet-stream"),
+      size: Number(attachment.size || blob.size || 0) || 0,
+      blob,
+      grokFileId: String(attachment.grokFileId || ""),
+      grokFileUri: String(attachment.grokFileUri || ""),
+      grokUploadedAt: Number(attachment.grokUploadedAt || 0) || 0,
+      createdAt,
+      updatedAt: Number(attachment.updatedAt || createdAt) || createdAt
+    };
+  }
+  function createChatSessionStore(options = {}) {
+    const {
+      dbName = "grok2api-chat-db",
+      dbVersion = 3
+    } = options;
+    let dbPromise = null;
+    async function openDatabase() {
+      if (dbPromise) return dbPromise;
+      dbPromise = new Promise((resolve, reject) => {
+        if (typeof indexedDB === "undefined") {
+          reject(new Error("\u5F53\u524D\u73AF\u5883\u4E0D\u652F\u6301 IndexedDB"));
+          return;
+        }
+        const request = indexedDB.open(dbName, dbVersion);
+        request.onupgradeneeded = () => {
+          const db = request.result;
+          if (!db.objectStoreNames.contains("sessions")) {
+            const sessionsStore = db.createObjectStore("sessions", { keyPath: "id" });
+            sessionsStore.createIndex("updatedAt", "updatedAt");
+          }
+          if (!db.objectStoreNames.contains("messages")) {
+            const messagesStore = db.createObjectStore("messages", { keyPath: "id" });
+            messagesStore.createIndex("sessionId", "sessionId");
+            messagesStore.createIndex("sessionIdOrder", ["sessionId", "order"]);
+          }
+          if (!db.objectStoreNames.contains("attachments")) {
+            const attachmentsStore = db.createObjectStore("attachments", { keyPath: "id" });
+            attachmentsStore.createIndex("sessionId", "sessionId");
+            attachmentsStore.createIndex("updatedAt", "updatedAt");
+          }
+          if (!db.objectStoreNames.contains("meta")) {
+            db.createObjectStore("meta", { keyPath: "key" });
+          }
+        };
+        request.onsuccess = () => {
+          const db = request.result;
+          db.onversionchange = () => {
+            db.close();
+            dbPromise = null;
+          };
+          resolve(db);
+        };
+        request.onerror = () => {
+          dbPromise = null;
+          reject(request.error || new Error("\u6253\u5F00 IndexedDB \u5931\u8D25"));
+        };
+      });
+      return dbPromise;
+    }
+    async function withTransaction(storeNames, mode, runner) {
+      const db = await openDatabase();
+      const transaction = db.transaction(storeNames, mode);
+      const result = await runner(transaction);
+      await waitForTransaction(transaction);
+      return result;
+    }
+    async function getMeta(key) {
+      return withTransaction(["meta"], "readonly", async (transaction) => {
+        const record = await promisifyRequest(transaction.objectStore("meta").get(key));
+        return record ? record.value : null;
+      });
+    }
+    async function setMeta(key, value) {
+      return withTransaction(["meta"], "readwrite", async (transaction) => {
+        transaction.objectStore("meta").put({ key, value });
+      });
+    }
+    async function getAllSessions() {
+      return withTransaction(["sessions"], "readonly", async (transaction) => {
+        const rows = await promisifyRequest(transaction.objectStore("sessions").getAll());
+        return Array.isArray(rows) ? rows.map((row) => normalizeSessionMeta(row)).filter(Boolean).sort((a, b) => Number(b.updatedAt || 0) - Number(a.updatedAt || 0)) : [];
+      });
+    }
+    async function saveSession(session) {
+      const normalized = normalizeSessionMeta(session);
+      if (!normalized || !normalized.id) return;
+      return withTransaction(["sessions"], "readwrite", async (transaction) => {
+        transaction.objectStore("sessions").put(normalized);
+      });
+    }
+    async function saveSessions(sessions) {
+      const rows = Array.isArray(sessions) ? sessions.map((item) => normalizeSessionMeta(item)).filter(Boolean) : [];
+      return withTransaction(["sessions"], "readwrite", async (transaction) => {
+        const store = transaction.objectStore("sessions");
+        rows.forEach((row) => {
+          if (row.id) store.put(row);
+        });
+      });
+    }
+    async function getSessionMessages(sessionId) {
+      return withTransaction(["messages"], "readonly", async (transaction) => {
+        const store = transaction.objectStore("messages");
+        const rows = await promisifyRequest(store.index("sessionId").getAll(sessionId));
+        rows.sort((a, b) => Number(a.order || 0) - Number(b.order || 0));
+        return Array.isArray(rows) ? rows.map((row, index) => normalizeStoredMessage(sessionId, row, index)).filter(Boolean) : [];
+      });
+    }
+    async function saveMessage(sessionId, message, orderHint = 0) {
+      const normalized = normalizeStoredMessage(sessionId, message, orderHint);
+      if (!normalized || !normalized.id) return;
+      return withTransaction(["messages"], "readwrite", async (transaction) => {
+        transaction.objectStore("messages").put(normalized);
+      });
+    }
+    async function saveMessages(sessionId, messages) {
+      const rows = Array.isArray(messages) ? messages.map((item, index) => normalizeStoredMessage(sessionId, item, index)).filter(Boolean) : [];
+      return withTransaction(["messages"], "readwrite", async (transaction) => {
+        const store = transaction.objectStore("messages");
+        rows.forEach((row) => {
+          store.put(row);
+        });
+      });
+    }
+    async function saveAttachment(sessionId, attachment) {
+      const normalized = normalizeAttachmentRecord(sessionId, attachment);
+      if (!normalized) return null;
+      await withTransaction(["attachments"], "readwrite", async (transaction) => {
+        transaction.objectStore("attachments").put(normalized);
+      });
+      return {
+        id: normalized.id,
+        sessionId: normalized.sessionId,
+        name: normalized.name,
+        mime: normalized.mime,
+        size: normalized.size,
+        grokFileId: normalized.grokFileId,
+        grokFileUri: normalized.grokFileUri,
+        grokUploadedAt: normalized.grokUploadedAt,
+        createdAt: normalized.createdAt,
+        updatedAt: normalized.updatedAt
+      };
+    }
+    async function getAttachment(id) {
+      const attachmentId = String(id || "").trim();
+      if (!attachmentId) return null;
+      return withTransaction(["attachments"], "readonly", async (transaction) => {
+        const row = await promisifyRequest(transaction.objectStore("attachments").get(attachmentId));
+        return row && row.blob instanceof Blob ? row : null;
+      });
+    }
+    async function updateAttachmentMeta(id, patch) {
+      const attachmentId = String(id || "").trim();
+      if (!attachmentId || !patch || typeof patch !== "object") return null;
+      return withTransaction(["attachments"], "readwrite", async (transaction) => {
+        const store = transaction.objectStore("attachments");
+        const row = await promisifyRequest(store.get(attachmentId));
+        if (!row) return null;
+        const updated = {
+          ...row,
+          grokFileId: String(patch.grokFileId || patch.fileId || row.grokFileId || ""),
+          grokFileUri: String(patch.grokFileUri || patch.fileUri || row.grokFileUri || ""),
+          grokUploadedAt: Number(patch.grokUploadedAt || patch.uploadedAt || Date.now()) || Date.now(),
+          updatedAt: Date.now()
+        };
+        store.put(updated);
+        return updated;
+      });
+    }
+    async function deleteSessionAttachments(sessionId) {
+      return withTransaction(["attachments"], "readwrite", async (transaction) => {
+        const store = transaction.objectStore("attachments");
+        const index = store.index("sessionId");
+        await new Promise((resolve, reject) => {
+          const request = index.openKeyCursor(IDBKeyRange.only(sessionId));
+          request.onsuccess = () => {
+            const cursor = request.result;
+            if (!cursor) {
+              resolve();
+              return;
+            }
+            store.delete(cursor.primaryKey);
+            cursor.continue();
+          };
+          request.onerror = () => reject(request.error || new Error("\u5220\u9664\u4F1A\u8BDD\u9644\u4EF6\u5931\u8D25"));
+        });
+      });
+    }
+    async function deleteSessionMessages(sessionId) {
+      return withTransaction(["messages"], "readwrite", async (transaction) => {
+        const store = transaction.objectStore("messages");
+        const index = store.index("sessionId");
+        await new Promise((resolve, reject) => {
+          const request = index.openKeyCursor(IDBKeyRange.only(sessionId));
+          request.onsuccess = () => {
+            const cursor = request.result;
+            if (!cursor) {
+              resolve();
+              return;
+            }
+            store.delete(cursor.primaryKey);
+            cursor.continue();
+          };
+          request.onerror = () => reject(request.error || new Error("\u5220\u9664\u4F1A\u8BDD\u6D88\u606F\u5931\u8D25"));
+        });
+      });
+    }
+    async function deleteSession(sessionId) {
+      return withTransaction(["sessions", "messages", "attachments"], "readwrite", async (transaction) => {
+        transaction.objectStore("sessions").delete(sessionId);
+        const deleteBySession = (storeName, errorMessage) => new Promise((resolve, reject) => {
+          const store = transaction.objectStore(storeName);
+          const index = store.index("sessionId");
+          const request = index.openKeyCursor(IDBKeyRange.only(sessionId));
+          request.onsuccess = () => {
+            const cursor = request.result;
+            if (!cursor) {
+              resolve();
+              return;
+            }
+            store.delete(cursor.primaryKey);
+            cursor.continue();
+          };
+          request.onerror = () => reject(request.error || new Error(errorMessage));
+        });
+        await Promise.all([
+          deleteBySession("messages", "\u5220\u9664\u4F1A\u8BDD\u6D88\u606F\u5931\u8D25"),
+          deleteBySession("attachments", "\u5220\u9664\u4F1A\u8BDD\u9644\u4EF6\u5931\u8D25")
+        ]);
+      });
+    }
+    async function importLegacySnapshot(snapshot) {
+      const sessions = Array.isArray(snapshot && snapshot.sessions) ? snapshot.sessions : [];
+      const activeId = String(snapshot && snapshot.activeId || "");
+      return withTransaction(["sessions", "messages", "meta"], "readwrite", async (transaction) => {
+        const sessionsStore = transaction.objectStore("sessions");
+        const messagesStore = transaction.objectStore("messages");
+        const metaStore = transaction.objectStore("meta");
+        sessions.forEach((session, sessionIndex) => {
+          const normalizedSession = normalizeSessionMeta(session);
+          if (!normalizedSession || !normalizedSession.id) return;
+          sessionsStore.put(normalizedSession);
+          const messages = Array.isArray(session.messages) ? session.messages : [];
+          messages.forEach((message, messageIndex) => {
+            const normalizedMessage = normalizeStoredMessage(normalizedSession.id, message, messageIndex);
+            if (!normalizedMessage) return;
+            if (!Number.isFinite(normalizedMessage.order)) {
+              normalizedMessage.order = messageIndex;
+            }
+            if (!normalizedMessage.createdAt) {
+              normalizedMessage.createdAt = normalizedSession.createdAt + messageIndex;
+            }
+            if (!normalizedMessage.updatedAt) {
+              normalizedMessage.updatedAt = normalizedMessage.createdAt;
+            }
+            messagesStore.put(normalizedMessage);
+          });
+        });
+        metaStore.put({ key: "activeSessionId", value: activeId });
+        metaStore.put({ key: "schemaVersion", value: dbVersion });
+        metaStore.put({ key: "legacyMigratedAt", value: Date.now() });
+      });
+    }
+    async function getState() {
+      const [activeId, sessions] = await Promise.all([
+        getMeta("activeSessionId"),
+        getAllSessions()
+      ]);
+      return {
+        activeId: typeof activeId === "string" ? activeId : "",
+        sessions
+      };
+    }
+    async function requestPersistentStorage() {
+      if (!navigator.storage || typeof navigator.storage.persist !== "function") return false;
+      try {
+        return await navigator.storage.persist();
+      } catch (error) {
+        return false;
+      }
+    }
+    async function estimateStorage() {
+      if (!navigator.storage || typeof navigator.storage.estimate !== "function") return null;
+      try {
+        return await navigator.storage.estimate();
+      } catch (error) {
+        return null;
+      }
+    }
+    return {
+      openDatabase,
+      getMeta,
+      setMeta,
+      getAllSessions,
+      getState,
+      saveSession,
+      saveSessions,
+      getSessionMessages,
+      saveMessage,
+      saveMessages,
+      saveAttachment,
+      getAttachment,
+      updateAttachmentMeta,
+      deleteSessionAttachments,
+      deleteSessionMessages,
+      deleteSession,
+      importLegacySnapshot,
+      requestPersistentStorage,
+      estimateStorage
+    };
+  }
+
   // app/static/public/js/chat.js
   (() => {
+    if (typeof window.requirePublicAccess === "function") {
+      window.requirePublicAccess();
+    }
     const modelSelect = document.getElementById("modelSelect");
     const modelPicker = document.getElementById("modelPicker");
     const modelPickerBtn = document.getElementById("modelPickerBtn");
@@ -3042,8 +3564,9 @@
     const STORAGE_KEY = "grok2api_chat_sessions";
     const SESSION_STORAGE_FALLBACK_KEY = "grok2api_chat_sessions_fallback";
     const SIDEBAR_STATE_KEY = "grok2api_chat_sidebar_collapsed";
-    const MAX_CONTEXT_MESSAGES = 30;
-    const MAX_PERSIST_SESSIONS = 12;
+    const ACTIVE_SESSION_STORAGE_KEY = "grok2api_chat_active_session_id";
+    const LEGACY_MIGRATED_KEY = "grok2api_chat_sessions_migrated";
+    const STORAGE_SCHEMA_VERSION = 3;
     const AUTO_SCROLL_THRESHOLD = 48;
     const STREAM_RENDER_INTERVAL_MS = 96;
     const STREAM_PERSIST_INTERVAL_MS = 320;
@@ -3051,6 +3574,21 @@
     const SEND_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2L11 13"></path><path d="M22 2L15 22L11 13L2 9L22 2Z"></path></svg>';
     const STOP_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none"><rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"></rect></svg>';
     let lastStorageErrorToastAt = 0;
+    const chatSessionStore = createChatSessionStore({ dbVersion: STORAGE_SCHEMA_VERSION });
+    let storageQueue = Promise.resolve();
+    let storageFallbackMode = false;
+    const attachmentObjectUrls = /* @__PURE__ */ new Map();
+    const sidebarHome = chatSidebar ? {
+      parent: chatSidebar.parentNode,
+      next: chatSidebar.nextSibling
+    } : null;
+    const sidebarOverlayHome = sidebarOverlay ? {
+      parent: sidebarOverlay.parentNode,
+      next: sidebarOverlay.nextSibling
+    } : null;
+    if (sidebarToggle && sidebarToggle.parentElement !== document.body) {
+      document.body.appendChild(sidebarToggle);
+    }
     function generateId() {
       return crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2);
     }
@@ -3090,6 +3628,85 @@
       if (/^data:/i.test(raw)) return "";
       return trimPersistText(raw, 2048);
     }
+    function buildIndexedDbAttachmentUrl(attachmentId) {
+      const id = String(attachmentId || "").trim();
+      return id ? `indexeddb:chat-attachment:${id}` : "";
+    }
+    function parseIndexedDbAttachmentUrl(value) {
+      const raw = String(value || "").trim();
+      const prefix = "indexeddb:chat-attachment:";
+      return raw.startsWith(prefix) ? raw.slice(prefix.length) : "";
+    }
+    function getImageBlockAttachmentId(block) {
+      if (!block || typeof block !== "object") return "";
+      if (block.attachmentId) return String(block.attachmentId || "").trim();
+      const imageUrl = block.image_url && typeof block.image_url === "object" ? String(block.image_url.url || "").trim() : String(block.url || "").trim();
+      return parseIndexedDbAttachmentUrl(imageUrl);
+    }
+    function getFileBlockAttachmentId(block) {
+      if (!block || typeof block !== "object") return "";
+      if (block.attachmentId) return String(block.attachmentId || "").trim();
+      const fileData = block.file && typeof block.file === "object" ? String(block.file.file_data || "").trim() : String(block.url || block.data || "").trim();
+      return parseIndexedDbAttachmentUrl(fileData);
+    }
+    function rememberAttachmentObjectUrl(attachmentId, blob) {
+      const id = String(attachmentId || "").trim();
+      if (!id || !(blob instanceof Blob)) return "";
+      const existing = attachmentObjectUrls.get(id);
+      if (existing) return existing;
+      const objectUrl = URL.createObjectURL(blob);
+      attachmentObjectUrls.set(id, objectUrl);
+      return objectUrl;
+    }
+    function revokeAttachmentObjectUrl(attachmentId) {
+      const id = String(attachmentId || "").trim();
+      if (!id) return;
+      const objectUrl = attachmentObjectUrls.get(id);
+      if (objectUrl) {
+        URL.revokeObjectURL(objectUrl);
+        attachmentObjectUrls.delete(id);
+      }
+    }
+    function blobToDataUrl(blob) {
+      return new Promise((resolve, reject) => {
+        if (!(blob instanceof Blob)) {
+          reject(new Error("\u6587\u4EF6\u5185\u5BB9\u4E0D\u53EF\u7528"));
+          return;
+        }
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ""));
+        reader.onerror = () => reject(reader.error || new Error("\u8BFB\u53D6\u6587\u4EF6\u5931\u8D25"));
+        reader.readAsDataURL(blob);
+      });
+    }
+    async function getStoredAttachment(attachmentId) {
+      const id = String(attachmentId || "").trim();
+      if (!id || storageFallbackMode) return null;
+      try {
+        return await chatSessionStore.getAttachment(id);
+      } catch (e) {
+        console.warn("load chat attachment failed", e);
+        return null;
+      }
+    }
+    async function resolveStoredAttachmentPreview(attachmentId) {
+      const record = await getStoredAttachment(attachmentId);
+      if (!record || !(record.blob instanceof Blob)) return null;
+      return {
+        name: record.name || "image",
+        mime: record.mime || record.blob.type || "image/jpeg",
+        size: Number(record.size || record.blob.size || 0) || 0,
+        data: rememberAttachmentObjectUrl(record.id, record.blob),
+        attachmentId: record.id,
+        grokFileId: record.grokFileId || "",
+        stored: true
+      };
+    }
+    async function resolveStoredAttachmentDataUrl(attachmentId) {
+      const record = await getStoredAttachment(attachmentId);
+      if (!record || !(record.blob instanceof Blob)) return "";
+      return blobToDataUrl(record.blob);
+    }
     function sanitizePersistContent(content) {
       if (typeof content === "string") {
         return trimPersistText(content);
@@ -3102,19 +3719,32 @@
         }
         if (block.type === "image_url") {
           const imageUrl = block.image_url && typeof block.image_url === "object" ? sanitizePersistUrl(block.image_url.url || "") : sanitizePersistUrl(block.url || "");
-          return imageUrl ? {
+          const attachmentId = getImageBlockAttachmentId(block);
+          const persistedUrl = attachmentId ? buildIndexedDbAttachmentUrl(attachmentId) : imageUrl;
+          return persistedUrl ? {
             type: "image_url",
-            image_url: { url: imageUrl },
-            persistedPreview: true
+            image_url: {
+              url: persistedUrl,
+              grok_file_id: block.grokFileId || block.file_id || ""
+            },
+            attachmentId: attachmentId || void 0,
+            grokFileId: block.grokFileId || block.file_id || "",
+            name: trimPersistText(block.name || "", 256),
+            mime: trimPersistText(block.mime || "", 128),
+            size: Number(block.size || 0) || 0,
+            persistedPreview: Boolean(attachmentId || imageUrl)
           } : { type: "image_url", persistedPreview: false };
         }
         if (block.type === "file") {
+          const attachmentId = getFileBlockAttachmentId(block);
           return {
             type: "file",
             name: trimPersistText(block.name || block.filename || "", 256),
             mime: trimPersistText(block.mime || "", 128),
             size: Number(block.size || 0) || 0,
-            url: sanitizePersistUrl(block.url || "")
+            attachmentId: attachmentId || void 0,
+            grokFileId: block.grokFileId || block.file_id || block.file && block.file.grok_file_id || "",
+            url: attachmentId ? buildIndexedDbAttachmentUrl(attachmentId) : sanitizePersistUrl(block.url || "")
           };
         }
         return null;
@@ -3140,6 +3770,18 @@
       if (Array.isArray(rendering.extraImages)) {
         sanitized.extraImages = rendering.extraImages.map((item) => sanitizePersistUrl(item)).filter(Boolean).slice(0, 24);
       }
+      if (Array.isArray(rendering.files)) {
+        sanitized.files = rendering.files.slice(0, 24).map((item) => ({
+          id: trimPersistText(item && item.id || "", 256),
+          name: trimPersistText(item && item.name || "", 256),
+          url: sanitizePersistUrl(item && item.url || ""),
+          mime: trimPersistText(item && item.mime || "", 128),
+          contentType: trimPersistText(item && item.contentType || "", 64),
+          size: Number(item && item.size || 0) || 0,
+          thumbnailUrl: sanitizePersistUrl(item && item.thumbnailUrl || ""),
+          thumbnailDarkUrl: sanitizePersistUrl(item && item.thumbnailDarkUrl || "")
+        })).filter((item) => item.url);
+      }
       const rawModelResponse = rendering.rawModelResponse && typeof rendering.rawModelResponse === "object" ? rendering.rawModelResponse : null;
       if (rawModelResponse) {
         sanitized.rawModelResponse = {
@@ -3162,7 +3804,12 @@
           caption: trimPersistText(item && item.caption || "", 512),
           sourceHref: sanitizePersistUrl(item && item.sourceHref || ""),
           sourceLabel: trimPersistText(item && item.sourceLabel || "", 256),
-          fallbackSrc: sanitizePersistUrl(item && item.fallbackSrc || "")
+          fallbackSrc: sanitizePersistUrl(item && item.fallbackSrc || ""),
+          kind: trimPersistText(item && item.kind || "", 32),
+          name: trimPersistText(item && item.name || "", 256),
+          mime: trimPersistText(item && item.mime || "", 128),
+          contentType: trimPersistText(item && item.contentType || "", 64),
+          size: Number(item && item.size || 0) || 0
         })).filter((item) => item.src || item.cardId) : []
       };
     }
@@ -3177,25 +3824,11 @@
       };
       return serialized;
     }
-    function buildSessionSnapshot(limitSessions = MAX_PERSIST_SESSIONS, activeOnly = false) {
+    function buildSessionSnapshot(activeOnly = false) {
       if (!sessionsData) return null;
       const sourceSessions = Array.isArray(sessionsData.sessions) ? sessionsData.sessions.slice() : [];
       sourceSessions.sort((a, b) => Number(b && b.updatedAt || 0) - Number(a && a.updatedAt || 0));
-      let picked = sourceSessions;
-      if (activeOnly) {
-        picked = sourceSessions.filter((session) => session && session.id === sessionsData.activeId);
-      } else if (limitSessions > 0 && sourceSessions.length > limitSessions) {
-        const activeId = sessionsData.activeId;
-        const selected = sourceSessions.slice(0, limitSessions);
-        if (activeId && !selected.some((session) => session && session.id === activeId)) {
-          const activeSession = sourceSessions.find((session) => session && session.id === activeId);
-          if (activeSession) {
-            selected.pop();
-            selected.push(activeSession);
-          }
-        }
-        picked = selected;
-      }
+      const picked = activeOnly ? sourceSessions.filter((session) => session && session.id === sessionsData.activeId) : sourceSessions;
       return {
         activeId: sessionsData.activeId,
         sessions: picked.map((session) => ({
@@ -3208,7 +3841,7 @@
       const now = Date.now();
       if (now - lastStorageErrorToastAt < 2500) return;
       lastStorageErrorToastAt = now;
-      toast("\u4F1A\u8BDD\u4FDD\u5B58\u5931\u8D25\uFF0C\u5DF2\u81EA\u52A8\u7CBE\u7B80\u672C\u5730\u7F13\u5B58", "error");
+      toast("\u4F1A\u8BDD\u4FDD\u5B58\u5931\u8D25\uFF0C\u5DF2\u5207\u6362\u5230\u4E34\u65F6\u6062\u590D\u6A21\u5F0F", "error");
     }
     function saveFallbackSession(snapshot) {
       if (!snapshot) return false;
@@ -3225,58 +3858,246 @@
       } catch (e) {
       }
     }
-    function saveSessions() {
-      if (!sessionsData) return;
-      const attempts = [
-        buildSessionSnapshot(MAX_PERSIST_SESSIONS, false),
-        buildSessionSnapshot(6, false),
-        buildSessionSnapshot(1, true)
-      ].filter(Boolean);
+    function cloneMessages(messages) {
+      return Array.isArray(messages) ? messages.map((item) => ({ ...item })) : [];
+    }
+    function normalizeRuntimeMessage(message, index = 0) {
+      if (!message || typeof message !== "object") return message;
+      const createdAt = Number(message.createdAt || message.updatedAt || 0) || Date.now() + index;
+      const updatedAt = Number(message.updatedAt || createdAt) || createdAt;
+      const order = Number(message.order);
+      return {
+        ...message,
+        id: String(message.id || generateId()),
+        createdAt,
+        updatedAt,
+        order: Number.isFinite(order) ? order : index
+      };
+    }
+    function normalizeRuntimeMessages(messages) {
+      return Array.isArray(messages) ? messages.map((item, index) => normalizeRuntimeMessage(item, index)).filter(Boolean) : [];
+    }
+    function buildSessionMeta(session) {
+      if (!session || typeof session !== "object") return null;
+      return {
+        id: session.id,
+        title: session.title || "\u65B0\u4F1A\u8BDD",
+        model: session.model || "",
+        grokConversationId: session.grokConversationId || "",
+        grokParentResponseId: session.grokParentResponseId || "",
+        createdAt: Number(session.createdAt || 0) || Date.now(),
+        updatedAt: Number(session.updatedAt || 0) || Date.now(),
+        isDefaultTitle: session.isDefaultTitle !== false,
+        unread: Boolean(session.unread)
+      };
+    }
+    function setActiveSessionHint(sessionId) {
       try {
-        let saved = false;
-        for (const snapshot of attempts) {
-          try {
-            localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
-            clearFallbackSession();
-            saved = true;
-            break;
-          } catch (e) {
-          }
-        }
-        if (!saved) {
-          const fallbackSnapshot = buildSessionSnapshot(1, true);
-          if (!saveFallbackSession(fallbackSnapshot)) {
-            notifyStorageFailure();
-          }
-        }
+        localStorage.setItem(ACTIVE_SESSION_STORAGE_KEY, sessionId || "");
       } catch (e) {
-        const fallbackSnapshot = buildSessionSnapshot(1, true);
+      }
+    }
+    function clearLegacySessionSnapshot() {
+      try {
+        localStorage.removeItem(STORAGE_KEY);
+        localStorage.setItem(LEGACY_MIGRATED_KEY, "1");
+      } catch (e) {
+      }
+      clearFallbackSession();
+    }
+    function enqueueStorageWork(work) {
+      storageQueue = storageQueue.then(() => work()).catch((error) => {
+        storageFallbackMode = true;
+        const fallbackSnapshot = buildSessionSnapshot(true);
         if (!saveFallbackSession(fallbackSnapshot)) {
           notifyStorageFailure();
         }
+        console.warn("chat session storage failed", error);
+      });
+      return storageQueue;
+    }
+    function persistSessionMeta(session) {
+      const meta = buildSessionMeta(session);
+      if (!meta || !meta.id || storageFallbackMode) return;
+      void enqueueStorageWork(async () => {
+        await chatSessionStore.saveSession(meta);
+      });
+    }
+    function persistMessageRecord(sessionId, message, orderHint = 0) {
+      if (!sessionId || !message || storageFallbackMode) return;
+      const normalized = serializeMessage(normalizeRuntimeMessage(message, orderHint));
+      void enqueueStorageWork(async () => {
+        await chatSessionStore.saveMessage(sessionId, normalized, orderHint);
+      });
+    }
+    function persistSessionMessages(session) {
+      if (!session || !session.id || storageFallbackMode) return;
+      const normalizedMessages = normalizeRuntimeMessages(session.messages).map((message) => serializeMessage(message));
+      void enqueueStorageWork(async () => {
+        await chatSessionStore.saveMessages(session.id, normalizedMessages);
+      });
+    }
+    function saveSessions() {
+      if (!sessionsData) return;
+      const sessionMetas = Array.isArray(sessionsData.sessions) ? sessionsData.sessions.map((session) => buildSessionMeta(session)).filter(Boolean) : [];
+      setActiveSessionHint(sessionsData.activeId || "");
+      if (storageFallbackMode) {
+        const fallbackSnapshot = buildSessionSnapshot(true);
+        if (!saveFallbackSession(fallbackSnapshot)) {
+          notifyStorageFailure();
+        }
+        return;
       }
+      void enqueueStorageWork(async () => {
+        await chatSessionStore.saveSessions(sessionMetas);
+        await chatSessionStore.setMeta("activeSessionId", sessionsData.activeId || "");
+        await chatSessionStore.setMeta("schemaVersion", STORAGE_SCHEMA_VERSION);
+        clearFallbackSession();
+        clearLegacySessionSnapshot();
+      });
+    }
+    async function readLegacySnapshot() {
+      let snapshot = null;
+      try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (raw) snapshot = JSON.parse(raw);
+      } catch (e) {
+        snapshot = null;
+      }
+      if (!snapshot) {
+        try {
+          const fallbackRaw = sessionStorage.getItem(SESSION_STORAGE_FALLBACK_KEY);
+          if (fallbackRaw) snapshot = JSON.parse(fallbackRaw);
+        } catch (e) {
+          snapshot = null;
+        }
+      }
+      if (!snapshot || !Array.isArray(snapshot.sessions) || !snapshot.sessions.length) return null;
+      snapshot.sessions = snapshot.sessions.map((session) => ({
+        ...session,
+        messages: normalizeRuntimeMessages(session.messages)
+      }));
+      return snapshot;
     }
     function getActiveSession() {
       if (!sessionsData) return null;
       return sessionsData.sessions.find((s) => s.id === sessionsData.activeId) || null;
     }
-    function trimMessageHistory(maxCount = MAX_CONTEXT_MESSAGES) {
-      if (!maxCount || maxCount <= 0) return;
-      if (messageHistory.length <= maxCount) return;
-      messageHistory = messageHistory.slice(-maxCount);
-      const session = getActiveSession();
-      if (session) {
-        session.messages = messageHistory.slice();
-        session.updatedAt = Date.now();
-        saveSessions();
-        renderSessionList();
+    async function ensureSessionMessagesLoaded(session) {
+      if (!session) return [];
+      if (session.messagesLoaded) {
+        if (!Array.isArray(session.messages)) session.messages = [];
+        return session.messages;
+      }
+      if (storageFallbackMode) {
+        session.messages = normalizeRuntimeMessages(session.messages);
+        session.messagesLoaded = true;
+        return session.messages;
+      }
+      try {
+        const messages = await chatSessionStore.getSessionMessages(session.id);
+        session.messages = normalizeRuntimeMessages(messages);
+        session.messagesLoaded = true;
+        return session.messages;
+      } catch (e) {
+        console.warn("load session messages failed", e);
+        storageFallbackMode = true;
+        session.messages = normalizeRuntimeMessages(session.messages);
+        session.messagesLoaded = true;
+        return session.messages;
       }
     }
-    function restoreActiveSession() {
+    function getMessageOrderBase(session) {
+      if (!session || !Array.isArray(session.messages) || !session.messages.length) return 0;
+      return session.messages.reduce((maxOrder, message, index) => {
+        const candidate = Number(message && message.order);
+        return Number.isFinite(candidate) ? Math.max(maxOrder, candidate) : Math.max(maxOrder, index);
+      }, -1) + 1;
+    }
+    async function buildUserAttachmentsFromContent(content) {
+      if (!Array.isArray(content)) return [];
+      const results = [];
+      for (const block of content) {
+        if (!block || typeof block !== "object") continue;
+        if (block.type === "image_url") {
+          const attachmentId = getImageBlockAttachmentId(block);
+          if (attachmentId) {
+            const preview = await resolveStoredAttachmentPreview(attachmentId);
+            if (preview) {
+              results.push({
+                ...preview,
+                name: block.name || preview.name || "\u56FE\u7247\u9644\u4EF6",
+                mime: block.mime || preview.mime || "image/jpeg",
+                size: Number(block.size || preview.size || 0) || 0
+              });
+              continue;
+            }
+            results.push({
+              mime: block.mime || "image/jpeg",
+              name: block.name || "\u56FE\u7247\u9644\u4EF6",
+              placeholder: true,
+              placeholderLabel: "\u56FE\u7247\u9644\u4EF6\u672A\u7F13\u5B58"
+            });
+            continue;
+          }
+          const imageUrl = block.image_url && typeof block.image_url === "object" ? String(block.image_url.url || "").trim() : "";
+          if (imageUrl) {
+            results.push({
+              mime: block.mime || "image/jpeg",
+              name: block.name || "image",
+              data: imageUrl,
+              size: Number(block.size || 0) || 0
+            });
+            continue;
+          }
+          results.push({
+            mime: block.mime || "image/jpeg",
+            name: block.name || "\u56FE\u7247\u9644\u4EF6",
+            placeholder: true,
+            placeholderLabel: "\u56FE\u7247\u9644\u4EF6\u672A\u7F13\u5B58"
+          });
+        }
+        if (block.type === "file") {
+          const attachmentId = getFileBlockAttachmentId(block);
+          if (attachmentId) {
+            const preview = await resolveStoredAttachmentPreview(attachmentId);
+            if (preview) {
+              results.push({
+                ...preview,
+                name: block.name || preview.name || "file",
+                mime: block.mime || preview.mime || "",
+                size: Number(block.size || preview.size || 0) || 0
+              });
+              continue;
+            }
+            results.push({
+              mime: block.mime || "",
+              name: block.name || "file",
+              placeholder: true,
+              placeholderLabel: "\u6587\u4EF6\u9644\u4EF6\u672A\u7F13\u5B58",
+              size: Number(block.size || 0) || 0
+            });
+            continue;
+          }
+          if (block.data || block.url) {
+            results.push({ mime: block.mime || "", name: block.name || "file", data: block.data || block.url });
+            continue;
+          }
+          results.push({
+            mime: block.mime || "",
+            name: block.name || "file",
+            placeholder: true,
+            placeholderLabel: "\u6587\u4EF6\u9644\u4EF6\u672A\u7F13\u5B58",
+            size: Number(block.size || 0) || 0
+          });
+        }
+      }
+      return results;
+    }
+    async function restoreActiveSession() {
       const session = getActiveSession();
       if (!session) return;
-      messageHistory = Array.isArray(session.messages) ? session.messages.slice() : [];
-      trimMessageHistory();
+      messageHistory = normalizeRuntimeMessages(session.messages);
       if (chatLog) chatLog.innerHTML = "";
       if (!messageHistory.length) {
         showEmptyState();
@@ -3296,35 +4117,7 @@
             updateMessage(entry, text, true);
           }
         } else if (entry && msg.role === "user") {
-          let msgAttachments = [];
-          if (Array.isArray(msg.content)) {
-            msgAttachments = msg.content.filter((b) => b && (b.type === "image_url" || b.type === "file")).map((b) => {
-              if (b.type === "image_url" && b.image_url && b.image_url.url) {
-                return { mime: "image/jpeg", name: "image", data: b.image_url.url };
-              }
-              if (b.type === "image_url") {
-                return {
-                  mime: "image/jpeg",
-                  name: "\u56FE\u7247\u9644\u4EF6",
-                  placeholder: true,
-                  placeholderLabel: "\u56FE\u7247\u9644\u4EF6\u672A\u7F13\u5B58"
-                };
-              }
-              if (b.type === "file" && (b.data || b.url)) {
-                return { mime: b.mime || "", name: b.name || "file", data: b.data || b.url };
-              }
-              if (b.type === "file") {
-                return {
-                  mime: b.mime || "",
-                  name: b.name || "file",
-                  placeholder: true,
-                  placeholderLabel: "\u6587\u4EF6\u9644\u4EF6\u672A\u7F13\u5B58",
-                  size: Number(b.size || 0) || 0
-                };
-              }
-              return null;
-            }).filter(Boolean);
-          }
+          const msgAttachments = await buildUserAttachmentsFromContent(msg.content);
           renderUserMessage(entry, text, msgAttachments);
         }
       }
@@ -3336,7 +4129,8 @@
     function syncCurrentSession() {
       const session = getActiveSession();
       if (!session) return;
-      session.messages = messageHistory.slice();
+      session.messages = normalizeRuntimeMessages(cloneMessages(messageHistory));
+      session.messagesLoaded = true;
       session.updatedAt = Date.now();
     }
     function updateSessionTitle(session) {
@@ -3390,7 +4184,8 @@
     function syncSessionModel() {
       const session = getActiveSession();
       if (!session) return;
-      session.model = modelSelect && modelSelect.value || "";
+      const nextModel = modelSelect && modelSelect.value || "";
+      session.model = nextModel;
     }
     function restoreSessionModel() {
       const session = getActiveSession();
@@ -3441,9 +4236,13 @@
         id,
         title: "\u65B0\u4F1A\u8BDD",
         isDefaultTitle: true,
+        model: modelSelect && modelSelect.value || "",
+        grokConversationId: "",
+        grokParentResponseId: "",
         createdAt: Date.now(),
         updatedAt: Date.now(),
-        messages: []
+        messages: [],
+        messagesLoaded: true
       };
       sessionsData.sessions.unshift(session);
       sessionsData.activeId = id;
@@ -3454,41 +4253,16 @@
       renderSessionList();
       if (isMobileSidebar()) closeSidebar();
     }
-    function collectChatUploadCacheNames(session) {
+    function collectChatAttachmentIds(session) {
       const picked = /* @__PURE__ */ new Set();
       if (!session || !Array.isArray(session.messages)) return [];
-      const tryCollectFromUrl = (value) => {
-        const text = String(value || "").trim();
-        if (!text) return;
-        const matches = text.match(/chat-upload-[a-z0-9]+\.[a-z0-9]+/ig);
-        if (matches) {
-          matches.forEach((name) => picked.add(name));
-        }
-      };
       const collectFromBlocks = (content) => {
-        if (typeof content === "string") {
-          tryCollectFromUrl(content);
-          return;
-        }
         if (!Array.isArray(content)) return;
         content.forEach((block) => {
           if (!block || typeof block !== "object") return;
-          if (block.cacheName) {
-            tryCollectFromUrl(block.cacheName);
-          }
-          if (block.url) {
-            tryCollectFromUrl(block.url);
-          }
-          if (block.data && typeof block.data === "string" && !String(block.data).startsWith("data:")) {
-            tryCollectFromUrl(block.data);
-          }
           if (block.type === "image_url") {
-            const imageUrl = block.image_url && typeof block.image_url === "object" ? block.image_url.url : "";
-            tryCollectFromUrl(imageUrl);
-          }
-          if (block.type === "file") {
-            const fileData = block.file && typeof block.file === "object" ? block.file.file_data : "";
-            tryCollectFromUrl(fileData);
+            const attachmentId = getImageBlockAttachmentId(block);
+            if (attachmentId) picked.add(attachmentId);
           }
         });
       };
@@ -3501,39 +4275,19 @@
       });
       return Array.from(picked);
     }
-    async function deleteChatUploadCache(files) {
-      const names = Array.isArray(files) ? Array.from(new Set(files.map((item) => String(item || "").trim()).filter((name) => /^chat-upload-/i.test(name)))) : [];
-      if (!names.length) return;
-      let headers = { "Content-Type": "application/json" };
-      try {
-        const authHeader = await ensurePublicKey();
-        headers = {
-          ...headers,
-          ...buildAuthHeaders(authHeader)
-        };
-      } catch (e) {
-      }
-      const res = await fetch("/v1/public/chat/delete-upload-cache", {
-        method: "POST",
-        headers,
-        body: JSON.stringify({ files: names })
-      });
-      if (!res.ok) {
-        throw new Error("\u5220\u9664\u804A\u5929\u4E0A\u4F20\u7F13\u5B58\u5931\u8D25");
-      }
-    }
     async function deleteSession(id) {
       if (!sessionsData) return;
       const idx = sessionsData.sessions.findIndex((s) => s.id === id);
       if (idx === -1) return;
       const targetSession = sessionsData.sessions[idx];
-      const cacheNames = collectChatUploadCacheNames(targetSession);
-      try {
-        await deleteChatUploadCache(cacheNames);
-      } catch (e) {
-        console.warn("deleteSession cache cleanup failed", e);
-      }
+      await ensureSessionMessagesLoaded(targetSession);
+      collectChatAttachmentIds(targetSession).forEach(revokeAttachmentObjectUrl);
       sessionsData.sessions.splice(idx, 1);
+      if (!storageFallbackMode) {
+        void enqueueStorageWork(async () => {
+          await chatSessionStore.deleteSession(id);
+        });
+      }
       if (!sessionsData.sessions.length) {
         createSession();
         return;
@@ -3541,20 +4295,27 @@
       if (sessionsData.activeId === id) {
         const newIdx = Math.min(idx, sessionsData.sessions.length - 1);
         sessionsData.activeId = sessionsData.sessions[newIdx].id;
-        restoreActiveSession();
+        await ensureSessionMessagesLoaded(sessionsData.sessions[newIdx]);
+        await restoreActiveSession();
         restoreSessionModel();
       }
       saveSessions();
       renderSessionList();
     }
-    function switchSession(id) {
+    async function switchSession(id) {
       if (!sessionsData || sessionsData.activeId === id) return;
       syncCurrentSession();
+      const previousSession = getActiveSession();
+      if (previousSession) {
+        persistSessionMeta(previousSession);
+        persistSessionMessages(previousSession);
+      }
       syncSessionModel();
       sessionsData.activeId = id;
       const target = getActiveSession();
+      await ensureSessionMessagesLoaded(target);
       if (target) target.unread = false;
-      restoreActiveSession();
+      await restoreActiveSession();
       restoreSessionModel();
       saveSessions();
       renderSessionList();
@@ -3562,6 +4323,31 @@
     }
     function isMobileSidebar() {
       return window.matchMedia("(max-width: 1024px)").matches;
+    }
+    function restoreElementHome(element, home) {
+      if (!element || !home || !home.parent) return;
+      if (element.parentNode === home.parent) return;
+      home.parent.insertBefore(element, home.next && home.next.parentNode === home.parent ? home.next : null);
+    }
+    function syncSidebarLayer() {
+      if (isMobileSidebar()) {
+        if (sidebarOverlay && sidebarOverlay.parentElement !== document.body) {
+          document.body.appendChild(sidebarOverlay);
+        }
+        if (chatSidebar && chatSidebar.parentElement !== document.body) {
+          document.body.appendChild(chatSidebar);
+        }
+        return;
+      }
+      if (chatSidebar) {
+        chatSidebar.classList.remove("open");
+      }
+      if (sidebarOverlay) {
+        sidebarOverlay.classList.remove("open");
+      }
+      document.body.classList.remove("sidebar-open");
+      restoreElementHome(chatSidebar, sidebarHome);
+      restoreElementHome(sidebarOverlay, sidebarOverlayHome);
     }
     function setSidebarCollapsed(collapsed) {
       const layout2 = chatSidebar ? chatSidebar.closest(".chat-layout") : null;
@@ -3573,22 +4359,29 @@
       }
     }
     function openSidebar() {
+      syncSidebarLayer();
       if (isMobileSidebar()) {
         if (chatSidebar) chatSidebar.classList.add("open");
         if (sidebarOverlay) sidebarOverlay.classList.add("open");
+        document.body.classList.add("sidebar-open");
         return;
       }
+      document.body.classList.remove("sidebar-open");
       setSidebarCollapsed(false);
     }
     function closeSidebar() {
+      syncSidebarLayer();
       if (isMobileSidebar()) {
         if (chatSidebar) chatSidebar.classList.remove("open");
         if (sidebarOverlay) sidebarOverlay.classList.remove("open");
+        document.body.classList.remove("sidebar-open");
         return;
       }
+      document.body.classList.remove("sidebar-open");
       setSidebarCollapsed(true);
     }
     function toggleSidebar() {
+      syncSidebarLayer();
       if (isMobileSidebar()) {
         if (chatSidebar && chatSidebar.classList.contains("open")) {
           closeSidebar();
@@ -3602,40 +4395,55 @@
       setSidebarCollapsed(!layout2.classList.contains("collapsed"));
     }
     function restoreSidebarState() {
+      syncSidebarLayer();
       try {
         const raw = localStorage.getItem(SIDEBAR_STATE_KEY);
         setSidebarCollapsed(raw === "1");
       } catch (e) {
       }
     }
-    function loadSessions() {
+    async function loadSessions() {
+      let state = null;
       try {
-        const raw = localStorage.getItem(STORAGE_KEY);
-        if (raw) {
-          sessionsData = JSON.parse(raw);
-          if (!sessionsData || !Array.isArray(sessionsData.sessions)) {
-            sessionsData = null;
+        await chatSessionStore.openDatabase();
+        await Promise.all([
+          chatSessionStore.requestPersistentStorage(),
+          chatSessionStore.estimateStorage()
+        ]);
+        state = await chatSessionStore.getState();
+        if (!state.sessions.length) {
+          const legacySnapshot = await readLegacySnapshot();
+          if (legacySnapshot) {
+            await chatSessionStore.importLegacySnapshot(legacySnapshot);
+            clearLegacySessionSnapshot();
+            state = {
+              activeId: legacySnapshot.activeId,
+              sessions: legacySnapshot.sessions.map((session) => ({
+                ...buildSessionMeta(session),
+                messages: session.messages,
+                messagesLoaded: true
+              }))
+            };
           }
         }
       } catch (e) {
-        sessionsData = null;
-      }
-      if (!sessionsData) {
-        try {
-          const fallbackRaw = sessionStorage.getItem(SESSION_STORAGE_FALLBACK_KEY);
-          if (fallbackRaw) {
-            sessionsData = JSON.parse(fallbackRaw);
-            if (!sessionsData || !Array.isArray(sessionsData.sessions)) {
-              sessionsData = null;
-            }
-          }
-        } catch (e) {
-          sessionsData = null;
+        console.warn("load IndexedDB sessions failed", e);
+        storageFallbackMode = true;
+        const legacySnapshot = await readLegacySnapshot();
+        if (legacySnapshot) {
+          state = {
+            activeId: legacySnapshot.activeId,
+            sessions: legacySnapshot.sessions.map((session) => ({
+              ...buildSessionMeta(session),
+              messages: normalizeRuntimeMessages(session.messages),
+              messagesLoaded: true
+            }))
+          };
         }
       }
-      if (!sessionsData || !sessionsData.sessions.length) {
+      if (!state || !Array.isArray(state.sessions) || !state.sessions.length) {
         const id = generateId();
-        sessionsData = {
+        state = {
           activeId: id,
           sessions: [{
             id,
@@ -3643,25 +4451,50 @@
             isDefaultTitle: true,
             createdAt: Date.now(),
             updatedAt: Date.now(),
-            messages: []
+            model: "",
+            grokConversationId: "",
+            grokParentResponseId: "",
+            unread: false,
+            messages: [],
+            messagesLoaded: true
           }]
         };
-        saveSessions();
       }
-      sessionsData.sessions.forEach((session) => {
-        if (session && typeof session.isDefaultTitle === "undefined") {
-          session.isDefaultTitle = isDefaultTitleValue(session.title);
+      sessionsData = {
+        activeId: state.activeId,
+        sessions: state.sessions.map((session) => ({
+          id: session.id,
+          title: session.title || "\u65B0\u4F1A\u8BDD",
+          model: session.model || "",
+          grokConversationId: session.grokConversationId || "",
+          grokParentResponseId: session.grokParentResponseId || "",
+          isDefaultTitle: typeof session.isDefaultTitle === "undefined" ? isDefaultTitleValue(session.title) : session.isDefaultTitle !== false,
+          createdAt: Number(session.createdAt || 0) || Date.now(),
+          updatedAt: Number(session.updatedAt || 0) || Date.now(),
+          unread: Boolean(session.unread),
+          messages: normalizeRuntimeMessages(session.messages),
+          messagesLoaded: Boolean(session.messagesLoaded)
+        }))
+      };
+      if (!sessionsData.activeId || !sessionsData.sessions.find((s) => s.id === sessionsData.activeId)) {
+        try {
+          const hinted = localStorage.getItem(ACTIVE_SESSION_STORAGE_KEY);
+          if (hinted && sessionsData.sessions.find((s) => s.id === hinted)) {
+            sessionsData.activeId = hinted;
+          }
+        } catch (e) {
+          sessionsData.activeId = sessionsData.sessions[0].id;
         }
-        if (!Array.isArray(session.messages)) {
-          session.messages = [];
-        }
-      });
+      }
       if (!sessionsData.activeId || !sessionsData.sessions.find((s) => s.id === sessionsData.activeId)) {
         sessionsData.activeId = sessionsData.sessions[0].id;
       }
-      restoreActiveSession();
+      const activeSession = getActiveSession();
+      await ensureSessionMessagesLoaded(activeSession);
+      await restoreActiveSession();
       restoreSessionModel();
       renderSessionList();
+      saveSessions();
     }
     function toast(message, type) {
       if (typeof showToast === "function") {
@@ -3963,7 +4796,7 @@
     }
     function buildRenderedImageMarkdown(card) {
       let image = card && card.image && typeof card.image === "object" ? card.image : null;
-      let original = image ? String(image.original || image.link || "").trim() : "";
+      let original = image ? String(image.original || image.thumbnail || "").trim() : "";
       let title = image ? normalizeSourceText2(image.title || "") : "";
       if (!original && card && card.image_chunk) {
         original = String(card.image_chunk.imageUrl || "").trim();
@@ -3973,7 +4806,7 @@
       }
       if (original && !original.startsWith("http")) {
         let basePath = original.startsWith("/") ? original : "/" + original;
-        original = "/v1/files/image" + basePath;
+        original = basePath.startsWith("/users/") ? "/v1/files/asset" + basePath : "/v1/files/image" + basePath;
       }
       if (!original) return "";
       return `
@@ -3989,7 +4822,8 @@
         const articleUrl = image ? String(image.link || "").trim() : "";
         const originalUrl = image ? String(image.original || "").trim() : "";
         const thumbnailUrl = image ? String(image.thumbnail || "").trim() : "";
-        const resolvedUrl = articleUrl || originalUrl;
+        const chunkUrl = card && card.image_chunk && typeof card.image_chunk === "object" ? String(card.image_chunk.imageUrl || "").trim() : "";
+        const resolvedUrl = articleUrl || originalUrl || thumbnailUrl || chunkUrl;
         if (!resolvedUrl) return;
         const sourceInfo = {
           href: resolvedUrl,
@@ -3998,7 +4832,11 @@
         };
         [
           originalUrl,
+          thumbnailUrl,
+          chunkUrl,
           normalizeRenderedImageUrl(originalUrl),
+          normalizeRenderedImageUrl(thumbnailUrl),
+          normalizeRenderedImageUrl(chunkUrl),
           articleUrl
         ].filter(Boolean).forEach((candidate) => {
           sourceMap.set(String(candidate), sourceInfo);
@@ -4017,15 +4855,16 @@
           const parsed = new URL(raw, window.location.origin);
           const host = String(parsed.hostname || "").toLowerCase();
           const path = String(parsed.pathname || "").trim();
-          const marker = "/v1/files/image/";
-          if (path.includes(marker)) {
+          const fileMarkers = ["/v1/files/asset/", "/v1/files/image/", "/v1/files/video/", "/v1/files/file/"];
+          const marker = fileMarkers.find((item) => path.includes(item));
+          if (marker) {
             return path.slice(path.indexOf(marker));
           }
           if (host === "localhost" || host === "127.0.0.1") {
             return path || "";
           }
           if (host === "assets.grok.com" && path) {
-            return `/v1/files/image${path.startsWith("/") ? path : `/${path}`}`;
+            return `/v1/files/asset${path.startsWith("/") ? path : `/${path}`}`;
           }
           return "";
         } catch (e) {
@@ -4033,7 +4872,13 @@
         }
       }
       const basePath = raw.startsWith("/") ? raw : `/${raw}`;
-      return basePath.startsWith("/v1/files/image/") ? basePath : `/v1/files/image${basePath}`;
+      if (basePath.startsWith("/v1/files/asset/") || basePath.startsWith("/v1/files/image/") || basePath.startsWith("/v1/files/video/") || basePath.startsWith("/v1/files/file/")) {
+        return basePath;
+      }
+      if (basePath.startsWith("/users/")) {
+        return `/v1/files/asset${basePath}`;
+      }
+      return `/v1/files/image${basePath}`;
     }
     function collectRenderedImageUrlsFromCard(card) {
       const urls = [];
@@ -4045,14 +4890,6 @@
         urls.push(card.image_chunk.imageUrl);
       }
       return urls.map((item) => normalizeRenderedImageUrl(item)).filter(Boolean);
-    }
-    function blobToDataUrl(blob) {
-      return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(String(reader.result || ""));
-        reader.onerror = () => reject(reader.error || new Error("\u8BFB\u53D6\u56FE\u7247\u5931\u8D25"));
-        reader.readAsDataURL(blob);
-      });
     }
     function inferImageExtension(mime, fallbackUrl) {
       const normalizedMime = String(mime || "").trim().toLowerCase();
@@ -4080,6 +4917,7 @@
           mime,
           name: `grok-image-${index + 1}.${ext}`,
           data,
+          blob,
           source: "assistant"
         };
       } catch (e) {
@@ -4132,12 +4970,17 @@
         toast("\u5F15\u7528\u56FE\u7247\u5931\u8D25", "error");
         return;
       }
-      imageAttachments.forEach((item) => {
-        attachments.push({
-          ...item,
-          name: buildUniqueFileName(item.name || "image")
-        });
-      });
+      for (const item of imageAttachments) {
+        const safeName = buildUniqueFileName(item.name || "image");
+        if (item.blob instanceof Blob) {
+          attachments.push(await saveChatImageAttachment(item.blob, safeName));
+        } else {
+          attachments.push({
+            ...item,
+            name: safeName
+          });
+        }
+      }
       showAttachmentBadge();
       if (promptInput) {
         promptInput.focus();
@@ -4323,7 +5166,7 @@ ${renderedAnswer}`.trim();
           const caption = mergedAlt && mergedAlt !== "image" ? `<figcaption class="message-image-caption">${escapeHtml2(mergedAlt)}</figcaption>` : "";
           const sourceBadge = sourceLabel ? `<a class="message-image-source" href="${sourceHref}" target="_blank" rel="noopener noreferrer" title="${sourceHref}">${sourceLabel}</a>` : "";
           const fallbackAttr = fallbackSrc ? ` data-fallback-src="${fallbackSrc}"` : "";
-          return `<figure class="message-image-card"><img src="${safeUrl}" alt="${safeAlt}" loading="lazy" referrerpolicy="no-referrer" crossorigin="anonymous"${fallbackAttr}>${sourceBadge}${caption}</figure>`;
+          return `<figure class="message-image-card"><img src="${safeUrl}" alt="${safeAlt}" loading="lazy"${fallbackAttr}>${sourceBadge}${caption}</figure>`;
         });
         output2 = output2.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (match, label, url) => {
           const safeLabel = escapeHtml2(decodeHtmlEntities(label || ""));
@@ -4627,9 +5470,15 @@ ${renderedAnswer}`.trim();
       if (!sections.length) {
         return renderBasicMarkdown(text, imageSourceMap);
       }
-      const renderThinkAgentSummary = (title) => {
+      const getThinkAgentBadge = (title, index) => {
+        const match = String(title || "").match(/Agent\s*(\d+)/i);
+        if (match) return match[1];
+        return String(index);
+      };
+      const renderThinkAgentSummary = (title, index) => {
         const safeTitle = escapeHtml2(title);
-        return `<summary><span class="think-agent-avatar" aria-hidden="true"></span><span class="think-agent-label">${safeTitle}</span></summary>`;
+        const safeBadge = escapeHtml2(getThinkAgentBadge(title, index));
+        return `<span class="think-agent-trigger"><span class="think-agent-avatar" aria-hidden="true"><span class="think-agent-number">${safeBadge}</span></span><span class="think-agent-label">${safeTitle}</span></span>`;
       };
       const renderGroups = (blocks, openAllGroups) => {
         const groups = [];
@@ -4657,26 +5506,40 @@ ${renderedAnswer}`.trim();
           return `<details class="think-rollout-group"${openAttr}><summary><span class="think-rollout-title"><span class="think-rollout-avatar" aria-hidden="true"></span><span class="think-rollout-label">${title}</span></span></summary><div class="think-rollout-body">${items}</div></details>`;
         }).join("");
       };
-      const agentBlocks = sections.map((section, idx) => {
+      const renderAgentCard = (agent, index, isActive = false) => {
+        const activeAttr = isActive ? ' data-active="true"' : "";
+        const safeTitle = escapeHtml2(agent.title);
+        const inner = agent.body || "<em>\uFF08\u7A7A\uFF09</em>";
+        return `<div class="think-agent" role="button" tabindex="0" data-agent-index="${index}" aria-label="${safeTitle}" title="${safeTitle}" style="--agent-order: ${index};"${activeAttr}>${renderThinkAgentSummary(agent.title, index)}<template class="think-agent-template">${inner}</template></div>`;
+      };
+      const agentItems = [];
+      sections.forEach((section) => {
         const blocks = parseRolloutBlocks(section.lines.join("\n"), section.title || "General");
         if (!section.title && blocks.length) {
           const synthetic = splitBlocksIntoSyntheticAgents(blocks);
           if (synthetic.length) {
-            return synthetic.map((agent, agentIdx) => {
+            synthetic.forEach((agent) => {
               const inner2 = renderFlatBlocks(agent.blocks, imageSourceMap);
-              const openAttr2 = openAll ? " open" : idx === 0 && agentIdx === 0 ? " open" : "";
-              return `<details class="think-agent"${openAttr2}>${renderThinkAgentSummary(agent.title)}<div class="think-agent-items">${inner2}</div></details>`;
-            }).join("");
+              agentItems.push({ title: agent.title, body: inner2 });
+            });
+            return;
           }
         }
         const inner = blocks.length ? renderGroups(blocks, openAll) : `<div class="think-rollout-body">${renderBasicMarkdown(section.lines.join("\n").trim(), imageSourceMap)}</div>`;
         if (!section.title) {
-          return `<div class="think-agent-items">${inner}</div>`;
+          agentItems.push({ title: "Grok Leader", body: inner });
+          return;
         }
-        const openAttr = openAll ? " open" : idx === 0 ? " open" : "";
-        return `<details class="think-agent"${openAttr}>${renderThinkAgentSummary(section.title)}<div class="think-agent-items">${inner}</div></details>`;
+        agentItems.push({ title: section.title, body: inner });
       });
-      return `<div class="think-agents">${agentBlocks.join("")}</div>`;
+      if (agentItems.length > 4) {
+        const visible = agentItems.slice(0, 4);
+        const hiddenCount = agentItems.length - visible.length;
+        const avatars = visible.map((agent, index) => `<span class="think-agent-stack-avatar" data-agent-index="${index}" title="${escapeHtml2(agent.title)}" aria-hidden="true"><span class="think-agent-number">${escapeHtml2(getThinkAgentBadge(agent.title, index))}</span></span>`).join("");
+        const cards = agentItems.map((agent, index) => renderAgentCard(agent, index, false)).join("");
+        return `<div class="think-agent-stack"><button type="button" class="think-agent-stack-toggle" aria-label="\u5C55\u5F00\u4EE3\u7406\u601D\u8003"><span class="think-agent-stack-avatars">${avatars}<span class="think-agent-stack-more">+${hiddenCount}</span></span></button><div class="think-agents">${cards}</div><button type="button" class="think-agent-stack-label">\u4EE3\u7406\u601D\u8003</button></div>`;
+      }
+      return `<div class="think-agents">${agentItems.map((agent, index) => renderAgentCard(agent, index, false)).join("")}</div>`;
     }
     function renderMarkdown(text, imageSourceMap = null) {
       const raw = text || "";
@@ -4770,6 +5633,24 @@ ${renderedAnswer}`.trim();
         }
       }
     }
+    function captureExpandedState(root, selector) {
+      if (!root || !root.querySelectorAll) return null;
+      const nodes = Array.from(root.querySelectorAll(selector));
+      if (!nodes.length) return null;
+      return nodes.map((node) => node.getAttribute("data-expanded") === "true");
+    }
+    function restoreExpandedState(root, selector, states) {
+      if (!root || !root.querySelectorAll || !Array.isArray(states) || !states.length) return;
+      const nodes = Array.from(root.querySelectorAll(selector));
+      const max = Math.min(nodes.length, states.length);
+      for (let i = 0; i < max; i += 1) {
+        if (states[i]) {
+          nodes[i].setAttribute("data-expanded", "true");
+        } else {
+          nodes[i].removeAttribute("data-expanded");
+        }
+      }
+    }
     function restoreScrollState(root, selector, states) {
       if (!root || !root.querySelectorAll || !Array.isArray(states) || !states.length) return;
       const nodes = Array.from(root.querySelectorAll(selector));
@@ -4826,10 +5707,9 @@ ${renderedAnswer}`.trim();
       const scrollContainer = shouldPreserveScroll ? getScrollContainer() : null;
       const viewportAnchor = shouldPreserveScroll ? fixedViewportAnchor || captureViewportAnchor(scrollContainer) : null;
       const savedThinkBlockState = captureOpenState(entry.contentNode, ".think-block");
-      const savedThinkAgentState = captureOpenState(entry.contentNode, ".think-agent");
+      const savedThinkAgentStackState = captureExpandedState(entry.contentNode, ".think-agent-stack");
       const savedRolloutState = captureOpenState(entry.contentNode, ".think-rollout-group");
       const savedThinkContentScroll = captureScrollState(entry.contentNode, ".think-content");
-      const savedThinkAgentItemsScroll = captureScrollState(entry.contentNode, ".think-agent-items");
       const savedThinkRolloutBodyScroll = captureScrollState(entry.contentNode, ".think-rollout-body");
       if (!entry.hasThink && entry.raw.includes("<think>")) {
         entry.hasThink = true;
@@ -4853,11 +5733,10 @@ ${renderedAnswer}`.trim();
         mediaItems
       });
       restoreOpenState(entry.contentNode, ".think-block", savedThinkBlockState);
-      restoreOpenState(entry.contentNode, ".think-agent", savedThinkAgentState);
+      restoreExpandedState(entry.contentNode, ".think-agent-stack", savedThinkAgentStackState);
       restoreOpenState(entry.contentNode, ".think-rollout-group", savedRolloutState);
       if (shouldPreserveScroll) {
         restoreScrollState(entry.contentNode, ".think-content", savedThinkContentScroll);
-        restoreScrollState(entry.contentNode, ".think-agent-items", savedThinkAgentItemsScroll);
         restoreScrollState(entry.contentNode, ".think-rollout-body", savedThinkRolloutBodyScroll);
       }
       if (entry.hasThink) {
@@ -5297,10 +6176,96 @@ ${renderedAnswer}`.trim();
       }
       scheduleAssistantRender(entry);
     }
+    function attachGrokFileIdToContent(content, attachmentId, fileId) {
+      if (!Array.isArray(content) || !attachmentId || !fileId) return content;
+      return content.map((block) => {
+        if (!block || typeof block !== "object") return block;
+        const blockAttachmentId = getImageBlockAttachmentId(block) || getFileBlockAttachmentId(block);
+        if (blockAttachmentId !== attachmentId) return block;
+        const next = { ...block, grokFileId: fileId };
+        if (next.type === "image_url") {
+          const image = next.image_url && typeof next.image_url === "object" ? { ...next.image_url } : {};
+          image.grok_file_id = fileId;
+          image.file_id = fileId;
+          next.image_url = image;
+        }
+        if (next.type === "file") {
+          const file = next.file && typeof next.file === "object" ? { ...next.file } : {};
+          file.grok_file_id = fileId;
+          file.file_id = fileId;
+          next.file = file;
+        }
+        return next;
+      });
+    }
+    function applyUploadedAttachmentMeta(session, uploadedItems) {
+      if (!session || !Array.isArray(uploadedItems) || !uploadedItems.length) return;
+      const byAttachment = /* @__PURE__ */ new Map();
+      uploadedItems.forEach((item) => {
+        if (!item || typeof item !== "object") return;
+        const attachmentId = String(item.attachmentId || "").trim();
+        const fileId = String(item.fileId || item.file_id || "").trim();
+        if (attachmentId && fileId) byAttachment.set(attachmentId, item);
+      });
+      if (!byAttachment.size || !Array.isArray(session.messages)) return;
+      session.messages = session.messages.map((message) => {
+        if (!message || message.role !== "user" || !Array.isArray(message.content)) return message;
+        let content = message.content;
+        byAttachment.forEach((item, attachmentId) => {
+          content = attachGrokFileIdToContent(content, attachmentId, item.fileId || item.file_id);
+        });
+        return { ...message, content, updatedAt: Date.now() };
+      });
+      if (sessionsData && sessionsData.activeId === session.id) {
+        messageHistory = cloneMessages(session.messages);
+      }
+      byAttachment.forEach((item, attachmentId) => {
+        if (!storageFallbackMode && chatSessionStore.updateAttachmentMeta) {
+          void enqueueStorageWork(async () => {
+            await chatSessionStore.updateAttachmentMeta(attachmentId, {
+              grokFileId: item.fileId || item.file_id || "",
+              grokFileUri: item.fileUri || item.file_uri || "",
+              uploadedAt: Date.now()
+            });
+          });
+        }
+      });
+    }
+    function applyGrokMetadata(grokMeta, targetSessionId = null) {
+      if (!grokMeta || typeof grokMeta !== "object" || !sessionsData) return;
+      const sessionId = targetSessionId || sessionsData.activeId;
+      const session = sessionsData.sessions.find((s) => s.id === sessionId);
+      if (!session) return;
+      const conversationId = String(grokMeta.conversationId || grokMeta.conversation_id || "").trim();
+      const parentResponseId = String(grokMeta.parentResponseId || grokMeta.parent_response_id || "").trim();
+      let changed = false;
+      if (conversationId && session.grokConversationId !== conversationId) {
+        session.grokConversationId = conversationId;
+        changed = true;
+      }
+      if (parentResponseId && session.grokParentResponseId !== parentResponseId) {
+        session.grokParentResponseId = parentResponseId;
+        changed = true;
+      }
+      const uploadedItems = Array.isArray(grokMeta.uploadedAttachments) ? grokMeta.uploadedAttachments : [];
+      if (uploadedItems.length) {
+        applyUploadedAttachmentMeta(session, uploadedItems);
+        changed = true;
+      }
+      if (changed) {
+        session.updatedAt = Date.now();
+        persistSessionMeta(session);
+        persistSessionMessages(session);
+        saveSessions();
+      }
+    }
     function upsertAssistantMessage(sessionId, messageId, assistantText, assistantSources = null, assistantRendering = null, committed = false, draftState = null) {
       if (!sessionId || !sessionsData || !messageId) return;
       const session = sessionsData.sessions.find((s) => s.id === sessionId);
       if (!session) return;
+      if (!Array.isArray(session.messages)) {
+        session.messages = [];
+      }
       const nextMessage = {
         id: messageId,
         role: "assistant",
@@ -5308,7 +6273,10 @@ ${renderedAnswer}`.trim();
         sources: assistantSources || null,
         rendering: assistantRendering || null,
         committed: Boolean(committed),
-        draftState: committed ? null : draftState || null
+        draftState: committed ? null : draftState || null,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        order: getMessageOrderBase(session)
       };
       const existingIndex = session.messages.findIndex((item) => item && item.role === "assistant" && item.id === messageId);
       if (existingIndex >= 0) {
@@ -5319,16 +6287,19 @@ ${renderedAnswer}`.trim();
       } else {
         session.messages.push(nextMessage);
       }
-      if (session.messages.length > MAX_CONTEXT_MESSAGES) {
-        session.messages = session.messages.slice(-MAX_CONTEXT_MESSAGES);
-      }
+      session.messages = normalizeRuntimeMessages(session.messages);
+      session.messagesLoaded = true;
       session.updatedAt = Date.now();
       updateSessionTitle(session);
       if (sessionsData.activeId === sessionId) {
-        messageHistory = session.messages.slice();
-        trimMessageHistory();
+        messageHistory = cloneMessages(session.messages);
       } else {
         session.unread = true;
+      }
+      const storedMessage = session.messages.find((item) => item && item.id === messageId);
+      persistSessionMeta(session);
+      if (storedMessage) {
+        persistMessageRecord(sessionId, storedMessage, existingIndex >= 0 ? storedMessage.order : session.messages.length - 1);
       }
       saveSessions();
       renderSessionList();
@@ -5476,14 +6447,14 @@ ${renderedAnswer}`.trim();
         if (!block) return;
         if (!entry.thinkingActive) {
           block.removeAttribute("data-thinking");
-          node.style.removeProperty("--think-spin-delay");
+          block.style.removeProperty("--think-spin-delay");
           activeThinkSpinEntries.delete(entry);
           block.querySelectorAll(".think-agent-avatar, .think-rollout-avatar").forEach((avatar) => {
             avatar.style.removeProperty("transform");
           });
         } else {
           block.setAttribute("data-thinking", "true");
-          node.style.setProperty("--think-spin-delay", spinOffset);
+          block.style.setProperty("--think-spin-delay", spinOffset);
           activeThinkSpinEntries.add(entry);
           ensureThinkSpinLoop();
         }
@@ -5502,8 +6473,9 @@ ${renderedAnswer}`.trim();
           }
           const elapsedMs = Math.max(0, now - (entry.startedAt || now));
           const angle = elapsedMs % 2200 / 2200 * 360;
-          entry.contentNode.querySelectorAll('.think-block[data-thinking="true"] .think-agent-avatar, .think-block[data-thinking="true"] .think-rollout-avatar').forEach((avatar) => {
-            avatar.style.transform = `rotate(${angle}deg)`;
+          entry.contentNode.querySelectorAll('.think-block[data-thinking="true"] .think-rollout-avatar').forEach((avatar) => {
+            const rotate = `${angle}deg`;
+            avatar.style.transform = `rotate(${rotate})`;
           });
         });
         if (activeThinkSpinEntries.size) {
@@ -5608,6 +6580,83 @@ ${renderedAnswer}`.trim();
         event.stopPropagation();
         expandInlineCitationCluster(target);
       });
+    }
+    function closeThinkAgentPopover() {
+      const popover = document.querySelector(".think-agent-popover");
+      if (popover) {
+        popover.setAttribute("data-closing", "true");
+        setTimeout(() => {
+          if (popover.isConnected) {
+            popover.remove();
+          }
+        }, 180);
+      }
+      document.querySelectorAll('.think-agent[data-active="true"]').forEach((agent) => {
+        agent.removeAttribute("data-active");
+      });
+    }
+    function positionThinkAgentPopover(popover, agent) {
+      if (!popover || !agent) return;
+      const rect = agent.getBoundingClientRect();
+      const margin = 12;
+      const width = Math.min(620, Math.max(320, window.innerWidth - margin * 2));
+      const left = Math.min(Math.max(margin, rect.left), window.innerWidth - width - margin);
+      const belowTop = rect.bottom + 10;
+      const maxHeight = Math.min(520, Math.max(220, window.innerHeight - belowTop - margin));
+      popover.style.width = `${width}px`;
+      popover.style.left = `${left}px`;
+      popover.style.top = `${belowTop}px`;
+      popover.style.maxHeight = `${maxHeight}px`;
+      popover.style.setProperty("--popover-origin-x", `${Math.min(Math.max(rect.left + rect.width / 2 - left, 24), width - 24)}px`);
+      popover.style.setProperty("--popover-origin-y", "0px");
+    }
+    function openThinkAgentPopover(agent) {
+      if (!(agent instanceof HTMLElement)) return;
+      const template = agent.querySelector(".think-agent-template");
+      const html = template ? template.innerHTML : "";
+      const label = agent.querySelector(".think-agent-label");
+      const title = label ? label.textContent || "" : "";
+      closeThinkAgentPopover();
+      agent.setAttribute("data-active", "true");
+      const popover = document.createElement("div");
+      popover.className = "think-agent-popover";
+      popover.innerHTML = `<div class="think-agent-popover-header"><span class="think-agent-avatar" aria-hidden="true"></span><span class="think-agent-label">${escapeHtml2(title)}</span></div><div class="think-agent-popover-body">${html || "<em>\uFF08\u7A7A\uFF09</em>"}</div>`;
+      document.body.appendChild(popover);
+      positionThinkAgentPopover(popover, agent);
+      requestAnimationFrame(() => {
+        popover.setAttribute("data-ready", "true");
+      });
+    }
+    let thinkAgentDrag = null;
+    function startThinkAgentsDrag(scroller, event) {
+      if (!(scroller instanceof HTMLElement)) return;
+      thinkAgentDrag = {
+        scroller,
+        x: event.clientX,
+        scrollLeft: scroller.scrollLeft,
+        moved: false
+      };
+      scroller.classList.add("is-dragging");
+    }
+    function moveThinkAgentsDrag(event) {
+      if (!thinkAgentDrag) return;
+      const delta = event.clientX - thinkAgentDrag.x;
+      if (Math.abs(delta) > 3) {
+        thinkAgentDrag.moved = true;
+        thinkAgentDrag.scroller.dataset.dragging = "1";
+      }
+      thinkAgentDrag.scroller.scrollLeft = thinkAgentDrag.scrollLeft - delta;
+    }
+    function endThinkAgentsDrag() {
+      if (!thinkAgentDrag) return;
+      const scroller = thinkAgentDrag.scroller;
+      scroller.classList.remove("is-dragging");
+      setTimeout(() => {
+        if (scroller.dataset.dragging === "1") {
+          delete scroller.dataset.dragging;
+        }
+      }, 0);
+      thinkAgentDrag = null;
     }
     function cleanExtractedUrl(url) {
       return String(url || "").trim().replace(/[),.;]+$/g, "");
@@ -5900,46 +6949,124 @@ ${renderedAnswer}`.trim();
     function buildMessages() {
       return buildMessagesFrom(messageHistory);
     }
-    function sanitizeRequestContent(content) {
+    async function sanitizeRequestContent(content) {
       if (typeof content === "string") return content;
       if (!Array.isArray(content)) return content;
-      return content.map((block) => {
-        if (!block || typeof block !== "object") return null;
+      const mapped = [];
+      for (const block of content) {
+        if (!block || typeof block !== "object") continue;
         if (block.type === "text") {
           const text = String(block.text || "");
-          return text ? { type: "text", text } : null;
+          if (text) mapped.push({ type: "text", text });
+          continue;
         }
         if (block.type === "image_url") {
+          const attachmentId = getImageBlockAttachmentId(block);
+          if (attachmentId) {
+            const dataUrl = await resolveStoredAttachmentDataUrl(attachmentId);
+            if (dataUrl) {
+              mapped.push({
+                type: "image_url",
+                image_url: {
+                  url: dataUrl,
+                  grok_file_id: block.grokFileId || "",
+                  file_id: block.grokFileId || ""
+                },
+                attachmentId,
+                name: block.name || block.filename || "image",
+                mime: block.mime || "image/jpeg",
+                size: Number(block.size || 0) || 0,
+                grokFileId: block.grokFileId || ""
+              });
+            } else {
+              throw new Error("\u56FE\u7247\u9644\u4EF6\u672A\u627E\u5230\uFF0C\u65E0\u6CD5\u7EE7\u7EED\u53D1\u9001\u8BE5\u4E0A\u4E0B\u6587");
+            }
+            continue;
+          }
           const imageUrl = block.image_url && typeof block.image_url === "object" ? String(block.image_url.url || "").trim() : String(block.url || "").trim();
-          if (!imageUrl) return null;
-          return { type: "image_url", image_url: { url: imageUrl } };
+          if (imageUrl) {
+            mapped.push({
+              type: "image_url",
+              image_url: {
+                url: imageUrl,
+                grok_file_id: block.grokFileId || "",
+                file_id: block.grokFileId || ""
+              },
+              attachmentId: block.attachmentId || void 0,
+              name: block.name || block.filename || "image",
+              mime: block.mime || "image/jpeg",
+              size: Number(block.size || 0) || 0,
+              grokFileId: block.grokFileId || ""
+            });
+          }
+          continue;
         }
         if (block.type === "file") {
+          const attachmentId = getFileBlockAttachmentId(block);
+          if (attachmentId) {
+            const dataUrl = await resolveStoredAttachmentDataUrl(attachmentId);
+            if (!dataUrl) {
+              throw new Error("\u6587\u4EF6\u9644\u4EF6\u672A\u627E\u5230\uFF0C\u65E0\u6CD5\u7EE7\u7EED\u53D1\u9001\u8BE5\u4E0A\u4E0B\u6587");
+            }
+            mapped.push({
+              type: "file",
+              file: {
+                file_data: dataUrl,
+                filename: block.name || block.filename || "file",
+                mime_type: block.mime || "",
+                size: Number(block.size || 0) || 0,
+                grok_file_id: block.grokFileId || "",
+                file_id: block.grokFileId || ""
+              },
+              attachmentId
+            });
+            continue;
+          }
           const fileData = block.file && typeof block.file === "object" ? String(block.file.file_data || "").trim() : String(block.url || block.data || "").trim();
-          if (!fileData) return null;
-          return { type: "file", file: { file_data: fileData } };
+          if (fileData) {
+            mapped.push({
+              type: "file",
+              file: {
+                file_data: fileData,
+                filename: block.name || block.filename || "",
+                mime_type: block.mime || "",
+                size: Number(block.size || 0) || 0,
+                grok_file_id: block.grokFileId || "",
+                file_id: block.grokFileId || ""
+              }
+            });
+          }
         }
-        return null;
-      }).filter(Boolean);
+      }
+      return mapped;
     }
-    function buildMessagesFrom(history) {
+    async function buildMessagesFrom(history) {
       const payload = [];
       const systemPrompt = systemInput ? systemInput.value.trim() : "";
       if (systemPrompt) {
         payload.push({ role: "system", content: systemPrompt });
       }
       for (const msg of history) {
-        payload.push({ role: msg.role, content: sanitizeRequestContent(msg.content) });
+        payload.push({ role: msg.role, content: await sanitizeRequestContent(msg.content) });
       }
       return payload;
     }
-    function buildPayload() {
+    async function buildPayload() {
+      const session = getActiveSession();
       const payload = {
         model: modelSelect && modelSelect.value || "grok-3",
-        messages: buildMessages(),
+        messages: await buildMessages(),
         stream: true,
         temperature: Number(tempRange ? tempRange.value : 0.8),
-        top_p: Number(topPRange ? topPRange.value : 0.95)
+        top_p: Number(topPRange ? topPRange.value : 0.95),
+        provider_options: {
+          grok: {
+            conversation_id: session ? session.grokConversationId || "" : "",
+            parent_response_id: session ? session.grokParentResponseId || "" : "",
+            reuse_conversation: true,
+            sources_mode: "full"
+          }
+        }
       };
       const reasoning = reasoningSelect ? reasoningSelect.value : "";
       if (reasoning) {
@@ -5947,13 +7074,22 @@ ${renderedAnswer}`.trim();
       }
       return payload;
     }
-    function buildPayloadFrom(history) {
+    async function buildPayloadFrom(history) {
+      const session = getActiveSession();
       const payload = {
         model: modelSelect && modelSelect.value || "grok-3",
-        messages: buildMessagesFrom(history),
+        messages: await buildMessagesFrom(history),
         stream: true,
         temperature: Number(tempRange ? tempRange.value : 0.8),
-        top_p: Number(topPRange ? topPRange.value : 0.95)
+        top_p: Number(topPRange ? topPRange.value : 0.95),
+        provider_options: {
+          grok: {
+            conversation_id: session ? session.grokConversationId || "" : "",
+            parent_response_id: session ? session.grokParentResponseId || "" : "",
+            reuse_conversation: true,
+            sources_mode: "full"
+          }
+        }
       };
       const reasoning = reasoningSelect ? reasoningSelect.value : "";
       if (reasoning) {
@@ -5966,18 +7102,23 @@ ${renderedAnswer}`.trim();
       modelPicker.classList.remove("open");
       modelPickerMenu.classList.add("hidden");
       modelPickerBtn.setAttribute("aria-expanded", "false");
+      document.body.classList.remove("model-picker-open");
+      restoreModelPickerMenu();
     }
     function openModelPicker() {
       if (!modelPicker || !modelPickerMenu || !modelPickerBtn) return;
+      positionModelPickerMenu();
       modelPicker.classList.add("open");
       modelPickerMenu.classList.remove("hidden");
       modelPickerBtn.setAttribute("aria-expanded", "true");
+      document.body.classList.add("model-picker-open");
     }
     function setModelValue(modelId) {
       if (!modelSelect || !modelId) return;
       modelSelect.value = modelId;
       if (modelPickerLabel) {
-        modelPickerLabel.textContent = modelId;
+        modelPickerLabel.textContent = formatModelLabel(modelId);
+        modelPickerLabel.title = modelId;
       }
       if (modelPickerMenu) {
         const options = modelPickerMenu.querySelectorAll(".model-option");
@@ -5996,6 +7137,38 @@ ${renderedAnswer}`.trim();
       modelSelect.innerHTML = "";
       modelPickerMenu.innerHTML = "";
       availableModels = Array.isArray(models) ? models.slice() : [];
+      const quickModels = [
+        { id: "grok-4.20-auto", title: "Auto", subtitle: "Chooses Fast or Expert" },
+        { id: "grok-4.20-fast", title: "Fast", subtitle: "Powered by Grok 4.20" },
+        { id: "grok-4.20-expert", title: "Expert", subtitle: "Powered by Grok 4.20" },
+        { id: "grok-4.20-heavy", title: "Heavy", subtitle: "Team of Experts" }
+      ].filter((item) => availableModels.includes(item.id));
+      if (quickModels.length) {
+        const quickWrap = document.createElement("div");
+        quickWrap.className = "model-quick-grid";
+        quickModels.forEach((item) => {
+          const quickBtn = document.createElement("button");
+          quickBtn.type = "button";
+          quickBtn.className = "model-option model-option-quick";
+          quickBtn.title = item.id;
+          quickBtn.dataset.value = item.id;
+          quickBtn.setAttribute("role", "option");
+          quickBtn.innerHTML = `
+          <span class="model-option-title">${item.title}</span>
+          <span class="model-option-subtitle">${item.subtitle}</span>
+        `;
+          quickBtn.addEventListener("click", () => {
+            setModelValue(item.id);
+            closeModelPicker();
+          });
+          quickWrap.appendChild(quickBtn);
+        });
+        modelPickerMenu.appendChild(quickWrap);
+        const divider = document.createElement("div");
+        divider.className = "model-option-divider";
+        divider.textContent = "\u5176\u4ED6\u6A21\u578B";
+        modelPickerMenu.appendChild(divider);
+      }
       availableModels.forEach((id) => {
         const option = document.createElement("option");
         option.value = id;
@@ -6004,9 +7177,13 @@ ${renderedAnswer}`.trim();
         const btn = document.createElement("button");
         btn.type = "button";
         btn.className = "model-option";
-        btn.textContent = id;
+        btn.title = id;
         btn.dataset.value = id;
         btn.setAttribute("role", "option");
+        btn.innerHTML = `
+        <span class="model-option-title">${formatModelLabel(id)}</span>
+        <span class="model-option-id">${id}</span>
+      `;
         btn.addEventListener("click", () => {
           setModelValue(id);
           closeModelPicker();
@@ -6016,7 +7193,7 @@ ${renderedAnswer}`.trim();
     }
     async function loadModels() {
       if (!modelSelect) return;
-      const fallback = ["grok-4.1-fast", "grok-4", "grok-3", "grok-3-mini", "grok-3-thinking", "grok-4.20-fast", "grok-4.20-expert", "grok-4.20-auto", "grok-4.3-beta"];
+      const fallback = ["grok-4.1-fast", "grok-4", "grok-3", "grok-3-mini", "grok-3-thinking", "grok-4.20-fast", "grok-4.20-expert", "grok-4.20-auto"];
       const preferred = "grok-4.20-auto";
       let list = fallback;
       try {
@@ -6030,7 +7207,7 @@ ${renderedAnswer}`.trim();
           }
           return;
         }
-        const res = await fetch("/v1/models", {
+        const res = await fetch("/v1/public/models", {
           cache: "no-store",
           headers: buildAuthHeaders(authHeader)
         });
@@ -6154,25 +7331,105 @@ ${renderedAnswer}`.trim();
         reader.readAsArrayBuffer(file);
       });
     }
-    async function uploadCachedChatImage(file) {
-      const formData = new FormData();
-      formData.append("file", file, file.name || "image");
-      let headers = {};
-      try {
-        const authHeader = await ensurePublicKey();
-        headers = buildAuthHeaders(authHeader);
-      } catch (e) {
+    function positionModelPickerMenu() {
+      if (!modelPicker || !modelPickerMenu || !modelPickerBtn) return;
+      const isMobile = window.matchMedia("(max-width: 640px)").matches;
+      if (!isMobile) {
+        restoreModelPickerMenu();
+        return;
       }
-      const res = await fetch("/v1/public/chat/upload-image", {
-        method: "POST",
-        headers,
-        body: formData
+      document.body.appendChild(modelPickerMenu);
+      const rect = modelPickerBtn.getBoundingClientRect();
+      const left = 12;
+      const right = 12;
+      const safeBottom = 12;
+      const bottomOffset = Math.max(window.innerHeight - rect.top + safeBottom, 88);
+      const maxHeight = Math.min(window.innerHeight * 0.52, Math.max(rect.top - 20, 220));
+      modelPickerMenu.style.left = `${left}px`;
+      modelPickerMenu.style.right = `${right}px`;
+      modelPickerMenu.style.top = "auto";
+      modelPickerMenu.style.bottom = `${bottomOffset}px`;
+      modelPickerMenu.style.width = "auto";
+      modelPickerMenu.style.maxHeight = `${maxHeight}px`;
+    }
+    function restoreModelPickerMenu() {
+      if (!modelPicker || !modelPickerMenu) return;
+      if (modelPickerMenu.parentElement !== modelPicker) {
+        modelPicker.appendChild(modelPickerMenu);
+      }
+      modelPickerMenu.style.left = "";
+      modelPickerMenu.style.right = "";
+      modelPickerMenu.style.top = "";
+      modelPickerMenu.style.bottom = "";
+      modelPickerMenu.style.width = "";
+      modelPickerMenu.style.maxHeight = "";
+    }
+    function formatModelLabel(modelId) {
+      const id = String(modelId || "").trim();
+      const friendly = {
+        "grok-4.20-auto": "Grok 4.20 Auto",
+        "grok-4.20-fast": "Grok 4.20 Fast",
+        "grok-4.20-expert": "Grok 4.20 Expert",
+        "grok-4.20-heavy": "Grok 4.20 Heavy",
+        "grok-4.20-multi-agent-0309": "Grok 4.20 Multi-Agent",
+        "grok-4.20-0309": "Grok 4.20 0309",
+        "grok-4.20-0309-reasoning": "Grok 4.20 0309 Reasoning",
+        "grok-4.20-0309-non-reasoning": "Grok 4.20 0309 Non-Reasoning",
+        "grok-4.20-0309-super": "Grok 4.20 0309 Super",
+        "grok-4.20-0309-reasoning-super": "Grok 4.20 0309 Reasoning Super",
+        "grok-4.20-0309-non-reasoning-super": "Grok 4.20 0309 Non-Reasoning Super",
+        "grok-4.20-0309-heavy": "Grok 4.20 0309 Heavy",
+        "grok-4.20-0309-reasoning-heavy": "Grok 4.20 0309 Reasoning Heavy",
+        "grok-4.20-0309-non-reasoning-heavy": "Grok 4.20 0309 Non-Reasoning Heavy",
+        "grok-4.1-fast": "Grok 4.1 Fast",
+        "grok-4.1-expert": "Grok 4.1 Expert",
+        "grok-4.1-mini": "Grok 4.1 Mini",
+        "grok-4.1-thinking": "Grok 4.1 Thinking"
+      };
+      return friendly[id] || id;
+    }
+    async function saveChatFileAttachment(file, safeName) {
+      if (!(file instanceof Blob)) {
+        throw new Error("\u6587\u4EF6\u5185\u5BB9\u4E0D\u53EF\u7528");
+      }
+      if (storageFallbackMode) {
+        const dataUrl = await blobToDataUrl(file);
+        return {
+          name: safeName,
+          data: dataUrl,
+          mime: file.type || "",
+          size: Number(file.size || 0) || 0,
+          stored: false
+        };
+      }
+      const activeSession = getActiveSession();
+      const sessionId = activeSession && activeSession.id ? activeSession.id : sessionsData && sessionsData.activeId || "";
+      const attachmentId = generateId();
+      await chatSessionStore.saveAttachment(sessionId, {
+        id: attachmentId,
+        name: safeName,
+        mime: file.type || "",
+        size: Number(file.size || 0) || 0,
+        blob: file,
+        createdAt: Date.now(),
+        updatedAt: Date.now()
       });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok || data.status !== "success" || !data.url) {
-        throw new Error(data.detail || "\u56FE\u7247\u7F13\u5B58\u4E0A\u4F20\u5931\u8D25");
-      }
-      return data;
+      return {
+        name: safeName,
+        data: rememberAttachmentObjectUrl(attachmentId, file),
+        mime: file.type || "",
+        size: Number(file.size || 0) || 0,
+        attachmentId,
+        blob: file,
+        stored: true
+      };
+    }
+    async function saveChatImageAttachment(file, safeName) {
+      const item = await saveChatFileAttachment(file, safeName);
+      return {
+        ...item,
+        mime: item.mime || "image/jpeg"
+      };
     }
     function buildUniqueFileName(name) {
       const baseName = name || "file";
@@ -6195,29 +7452,9 @@ ${renderedAnswer}`.trim();
         const safeName = buildUniqueFileName(file.name || "file");
         const isImage = String(file.type || "").startsWith("image/");
         if (isImage) {
-          const uploaded = await uploadCachedChatImage(file);
-          attachments.push({
-            name: safeName,
-            data: uploaded.url,
-            url: uploaded.url,
-            mime: uploaded.content_type || file.type || "image/jpeg",
-            size: Number(uploaded.size_bytes || file.size || 0) || 0,
-            cached: true,
-            cacheName: uploaded.filename || ""
-          });
+          attachments.push(await saveChatImageAttachment(file, safeName));
         } else {
-          let dataUrl = "";
-          try {
-            dataUrl = await readFileAsDataUrl(file);
-          } catch (e) {
-            dataUrl = await readFileAsDataUrlFallback(file);
-          }
-          attachments.push({
-            name: safeName,
-            data: dataUrl,
-            mime: file.type || "",
-            size: Number(file.size || 0) || 0
-          });
+          attachments.push(await saveChatFileAttachment(file, safeName));
         }
         try {
           showAttachmentBadge();
@@ -6345,7 +7582,6 @@ ${renderedAnswer}`.trim();
       userLockedStreamScroll = false;
       fixedViewportAnchor = null;
       abortController = new AbortController();
-      const payload = buildPayloadFrom(historySlice);
       let headers = { "Content-Type": "application/json" };
       try {
         const authHeader = await ensurePublicKey();
@@ -6353,6 +7589,7 @@ ${renderedAnswer}`.trim();
       } catch (e) {
       }
       try {
+        const payload = await buildPayloadFrom(historySlice);
         const res = await fetch("/v1/public/chat/completions", {
           method: "POST",
           headers,
@@ -6397,29 +7634,87 @@ ${renderedAnswer}`.trim();
       const attachmentsSnapshot = attachments.map((item) => ({ ...item }));
       const userEntry = createMessage("user", "");
       renderUserMessage(userEntry, prompt, attachmentsSnapshot);
+      const activeSession = getActiveSession();
       let content = prompt;
       if (attachments.length) {
         const blocks = [];
         if (prompt) {
           blocks.push({ type: "text", text: prompt });
         }
-        attachments.forEach((item) => {
+        for (const item of attachments) {
           const isImage = String(item.mime || "").startsWith("image/");
           if (isImage) {
-            blocks.push({ type: "image_url", image_url: { url: item.data } });
+            const attachmentId = String(item.attachmentId || "").trim();
+            if (attachmentId && item.blob instanceof Blob && !storageFallbackMode) {
+              await chatSessionStore.saveAttachment(activeSession && activeSession.id || "", {
+                id: attachmentId,
+                name: item.name || "image",
+                mime: item.mime || "image/jpeg",
+                size: Number(item.size || item.blob.size || 0) || 0,
+                blob: item.blob,
+                createdAt: Date.now(),
+                updatedAt: Date.now()
+              });
+            }
+            blocks.push({
+              type: "image_url",
+              image_url: { url: attachmentId ? buildIndexedDbAttachmentUrl(attachmentId) : item.data },
+              attachmentId: attachmentId || void 0,
+              name: item.name || "image",
+              mime: item.mime || "image/jpeg",
+              size: Number(item.size || 0) || 0,
+              grokFileId: item.grokFileId || ""
+            });
           } else {
-            blocks.push({ type: "file", file: { file_data: item.data } });
+            const attachmentId = String(item.attachmentId || "").trim();
+            if (attachmentId && item.blob instanceof Blob && !storageFallbackMode) {
+              await chatSessionStore.saveAttachment(activeSession && activeSession.id || "", {
+                id: attachmentId,
+                name: item.name || "file",
+                mime: item.mime || item.blob.type || "",
+                size: Number(item.size || item.blob.size || 0) || 0,
+                blob: item.blob,
+                createdAt: Date.now(),
+                updatedAt: Date.now()
+              });
+            }
+            blocks.push({
+              type: "file",
+              file: {
+                file_data: attachmentId ? buildIndexedDbAttachmentUrl(attachmentId) : item.data,
+                filename: item.name || "file",
+                mime_type: item.mime || "",
+                size: Number(item.size || 0) || 0,
+                grok_file_id: item.grokFileId || "",
+                file_id: item.grokFileId || ""
+              },
+              attachmentId: attachmentId || void 0,
+              name: item.name || "file",
+              mime: item.mime || "",
+              size: Number(item.size || 0) || 0,
+              grokFileId: item.grokFileId || ""
+            });
           }
-        });
+        }
         content = blocks;
       }
-      messageHistory.push({ role: "user", content });
-      trimMessageHistory();
+      const nextOrder = getMessageOrderBase(activeSession);
+      const userMessage = normalizeRuntimeMessage({
+        id: generateId(),
+        role: "user",
+        content,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        order: nextOrder
+      }, nextOrder);
+      messageHistory.push(userMessage);
       if (promptInput) promptInput.value = "";
       clearAttachment();
       syncCurrentSession();
       syncSessionModel();
       updateSessionTitle(getActiveSession());
+      persistMessageRecord(sessionsData ? sessionsData.activeId : "", userMessage, nextOrder);
+      persistSessionMeta(getActiveSession());
       saveSessions();
       renderSessionList();
       const sendSessionId = sessionsData ? sessionsData.activeId : null;
@@ -6433,7 +7728,6 @@ ${renderedAnswer}`.trim();
       userLockedStreamScroll = false;
       fixedViewportAnchor = null;
       abortController = new AbortController();
-      const payload = buildPayload();
       let headers = { "Content-Type": "application/json" };
       try {
         const authHeader = await ensurePublicKey();
@@ -6441,6 +7735,7 @@ ${renderedAnswer}`.trim();
       } catch (e) {
       }
       try {
+        const payload = await buildPayload();
         const res = await fetch("/v1/public/chat/completions", {
           method: "POST",
           headers,
@@ -6526,6 +7821,9 @@ ${renderedAnswer}`.trim();
               }
               try {
                 const json = JSON.parse(payload);
+                if (json && json.grok && typeof json.grok === "object") {
+                  applyGrokMetadata(json.grok, targetSessionId);
+                }
                 if (json && json.sources && typeof json.sources === "object") {
                   assistantEntry.sources = json.sources;
                   if (assistantEntry.row && assistantEntry.row.querySelector(".message-actions")) {
@@ -6613,6 +7911,43 @@ ${renderedAnswer}`.trim();
         });
       }
       document.addEventListener("click", (event) => {
+        const eventTarget = event.target instanceof Element ? event.target : null;
+        const agentButton = eventTarget ? eventTarget.closest(".think-agent") : null;
+        const stackToggle = eventTarget ? eventTarget.closest(".think-agent-stack-toggle, .think-agent-stack-label") : null;
+        const agentPopover = eventTarget ? eventTarget.closest(".think-agent-popover") : null;
+        if (stackToggle) {
+          event.preventDefault();
+          event.stopPropagation();
+          const stack = stackToggle.closest(".think-agent-stack");
+          if (stack) {
+            const expanded = stack.getAttribute("data-expanded") === "true";
+            if (expanded) {
+              stack.removeAttribute("data-expanded");
+            } else {
+              stack.setAttribute("data-expanded", "true");
+            }
+          }
+          return;
+        }
+        if (agentButton) {
+          const scroller = agentButton.closest(".think-agents");
+          if (scroller && scroller.dataset.dragging === "1") {
+            event.preventDefault();
+            event.stopPropagation();
+            return;
+          }
+          event.preventDefault();
+          event.stopPropagation();
+          if (agentButton.getAttribute("data-active") === "true") {
+            closeThinkAgentPopover();
+          } else {
+            openThinkAgentPopover(agentButton);
+          }
+          return;
+        }
+        if (!agentPopover) {
+          closeThinkAgentPopover();
+        }
         if (modelPicker && !modelPicker.contains(event.target)) {
           closeModelPicker();
         }
@@ -6621,6 +7956,33 @@ ${renderedAnswer}`.trim();
           return;
         }
         toggleSettings(false);
+      });
+      window.addEventListener("resize", () => {
+        syncSidebarLayer();
+        closeThinkAgentPopover();
+        if (modelPicker && modelPicker.classList.contains("open")) {
+          positionModelPickerMenu();
+        }
+      });
+      document.addEventListener("pointerdown", (event) => {
+        const eventTarget = event.target instanceof Element ? event.target : null;
+        const scroller = eventTarget ? eventTarget.closest(".think-agents") : null;
+        if (scroller) {
+          startThinkAgentsDrag(scroller, event);
+        }
+      });
+      document.addEventListener("pointermove", moveThinkAgentsDrag);
+      document.addEventListener("pointerup", endThinkAgentsDrag);
+      document.addEventListener("pointercancel", endThinkAgentsDrag);
+      document.addEventListener("keydown", (event) => {
+        const agent = event.target instanceof Element ? event.target.closest(".think-agent") : null;
+        if (!agent || event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        if (agent.getAttribute("data-active") === "true") {
+          closeThinkAgentPopover();
+        } else {
+          openThinkAgentPopover(agent);
+        }
       });
       if (promptInput) {
         let composing = false;
@@ -6810,6 +8172,7 @@ ${renderedAnswer}`.trim();
     updateRangeValues();
     setSendingState(false);
     bindEvents();
+    syncSidebarLayer();
     restoreSidebarState();
     loadSessions();
     loadModels();

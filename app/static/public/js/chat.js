@@ -2,8 +2,12 @@ import { buildMediaItems } from '../src/chat/media_items.js';
 import { PretextLayoutEngine } from '../src/chat/pretext_layout.js';
 import { splitStableAndTail, renderLiteMarkdown } from '../src/chat/stream_blocks.js';
 import { StreamRenderer } from '../src/chat/stream_renderer.js';
+import { createChatSessionStore } from '../src/chat/chat_session_store.js';
 
 (() => {
+  if (typeof window.requirePublicAccess === 'function') {
+    window.requirePublicAccess();
+  }
   const modelSelect = document.getElementById('modelSelect');
   const modelPicker = document.getElementById('modelPicker');
   const modelPickerBtn = document.getElementById('modelPickerBtn');
@@ -52,8 +56,9 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
   const STORAGE_KEY = 'grok2api_chat_sessions';
   const SESSION_STORAGE_FALLBACK_KEY = 'grok2api_chat_sessions_fallback';
   const SIDEBAR_STATE_KEY = 'grok2api_chat_sidebar_collapsed';
-  const MAX_CONTEXT_MESSAGES = 30;
-  const MAX_PERSIST_SESSIONS = 12;
+  const ACTIVE_SESSION_STORAGE_KEY = 'grok2api_chat_active_session_id';
+  const LEGACY_MIGRATED_KEY = 'grok2api_chat_sessions_migrated';
+  const STORAGE_SCHEMA_VERSION = 3;
   const AUTO_SCROLL_THRESHOLD = 48;
   const STREAM_RENDER_INTERVAL_MS = 96;
   const STREAM_PERSIST_INTERVAL_MS = 320;
@@ -61,6 +66,22 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
   const SEND_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2L11 13"></path><path d="M22 2L15 22L11 13L2 9L22 2Z"></path></svg>';
   const STOP_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none"><rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"></rect></svg>';
   let lastStorageErrorToastAt = 0;
+  const chatSessionStore = createChatSessionStore({ dbVersion: STORAGE_SCHEMA_VERSION });
+  let storageQueue = Promise.resolve();
+  let storageFallbackMode = false;
+  const attachmentObjectUrls = new Map();
+  const sidebarHome = chatSidebar ? {
+    parent: chatSidebar.parentNode,
+    next: chatSidebar.nextSibling
+  } : null;
+  const sidebarOverlayHome = sidebarOverlay ? {
+    parent: sidebarOverlay.parentNode,
+    next: sidebarOverlay.nextSibling
+  } : null;
+
+  if (sidebarToggle && sidebarToggle.parentElement !== document.body) {
+    document.body.appendChild(sidebarToggle);
+  }
 
   function generateId() {
     return crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2);
@@ -105,6 +126,99 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
     return trimPersistText(raw, 2048);
   }
 
+  function buildIndexedDbAttachmentUrl(attachmentId) {
+    const id = String(attachmentId || '').trim();
+    return id ? `indexeddb:chat-attachment:${id}` : '';
+  }
+
+  function parseIndexedDbAttachmentUrl(value) {
+    const raw = String(value || '').trim();
+    const prefix = 'indexeddb:chat-attachment:';
+    return raw.startsWith(prefix) ? raw.slice(prefix.length) : '';
+  }
+
+  function getImageBlockAttachmentId(block) {
+    if (!block || typeof block !== 'object') return '';
+    if (block.attachmentId) return String(block.attachmentId || '').trim();
+    const imageUrl = block.image_url && typeof block.image_url === 'object'
+      ? String(block.image_url.url || '').trim()
+      : String(block.url || '').trim();
+    return parseIndexedDbAttachmentUrl(imageUrl);
+  }
+
+  function getFileBlockAttachmentId(block) {
+    if (!block || typeof block !== 'object') return '';
+    if (block.attachmentId) return String(block.attachmentId || '').trim();
+    const fileData = block.file && typeof block.file === 'object'
+      ? String(block.file.file_data || '').trim()
+      : String(block.url || block.data || '').trim();
+    return parseIndexedDbAttachmentUrl(fileData);
+  }
+
+  function rememberAttachmentObjectUrl(attachmentId, blob) {
+    const id = String(attachmentId || '').trim();
+    if (!id || !(blob instanceof Blob)) return '';
+    const existing = attachmentObjectUrls.get(id);
+    if (existing) return existing;
+    const objectUrl = URL.createObjectURL(blob);
+    attachmentObjectUrls.set(id, objectUrl);
+    return objectUrl;
+  }
+
+  function revokeAttachmentObjectUrl(attachmentId) {
+    const id = String(attachmentId || '').trim();
+    if (!id) return;
+    const objectUrl = attachmentObjectUrls.get(id);
+    if (objectUrl) {
+      URL.revokeObjectURL(objectUrl);
+      attachmentObjectUrls.delete(id);
+    }
+  }
+
+  function blobToDataUrl(blob) {
+    return new Promise((resolve, reject) => {
+      if (!(blob instanceof Blob)) {
+        reject(new Error('文件内容不可用'));
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ''));
+      reader.onerror = () => reject(reader.error || new Error('读取文件失败'));
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  async function getStoredAttachment(attachmentId) {
+    const id = String(attachmentId || '').trim();
+    if (!id || storageFallbackMode) return null;
+    try {
+      return await chatSessionStore.getAttachment(id);
+    } catch (e) {
+      console.warn('load chat attachment failed', e);
+      return null;
+    }
+  }
+
+  async function resolveStoredAttachmentPreview(attachmentId) {
+    const record = await getStoredAttachment(attachmentId);
+    if (!record || !(record.blob instanceof Blob)) return null;
+    return {
+      name: record.name || 'image',
+      mime: record.mime || record.blob.type || 'image/jpeg',
+      size: Number(record.size || record.blob.size || 0) || 0,
+      data: rememberAttachmentObjectUrl(record.id, record.blob),
+      attachmentId: record.id,
+      grokFileId: record.grokFileId || '',
+      stored: true
+    };
+  }
+
+  async function resolveStoredAttachmentDataUrl(attachmentId) {
+    const record = await getStoredAttachment(attachmentId);
+    if (!record || !(record.blob instanceof Blob)) return '';
+    return blobToDataUrl(record.blob);
+  }
+
   function sanitizePersistContent(content) {
     if (typeof content === 'string') {
       return trimPersistText(content);
@@ -119,19 +233,32 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
         const imageUrl = block.image_url && typeof block.image_url === 'object'
           ? sanitizePersistUrl(block.image_url.url || '')
           : sanitizePersistUrl(block.url || '');
-        return imageUrl ? {
+        const attachmentId = getImageBlockAttachmentId(block);
+        const persistedUrl = attachmentId ? buildIndexedDbAttachmentUrl(attachmentId) : imageUrl;
+        return persistedUrl ? {
           type: 'image_url',
-          image_url: { url: imageUrl },
-          persistedPreview: true
+          image_url: {
+            url: persistedUrl,
+            grok_file_id: block.grokFileId || block.file_id || ''
+          },
+          attachmentId: attachmentId || undefined,
+          grokFileId: block.grokFileId || block.file_id || '',
+          name: trimPersistText(block.name || '', 256),
+          mime: trimPersistText(block.mime || '', 128),
+          size: Number(block.size || 0) || 0,
+          persistedPreview: Boolean(attachmentId || imageUrl)
         } : { type: 'image_url', persistedPreview: false };
       }
       if (block.type === 'file') {
+        const attachmentId = getFileBlockAttachmentId(block);
         return {
           type: 'file',
           name: trimPersistText(block.name || block.filename || '', 256),
           mime: trimPersistText(block.mime || '', 128),
           size: Number(block.size || 0) || 0,
-          url: sanitizePersistUrl(block.url || '')
+          attachmentId: attachmentId || undefined,
+          grokFileId: block.grokFileId || block.file_id || (block.file && block.file.grok_file_id) || '',
+          url: attachmentId ? buildIndexedDbAttachmentUrl(attachmentId) : sanitizePersistUrl(block.url || '')
         };
       }
       return null;
@@ -161,6 +288,21 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
         .map((item) => sanitizePersistUrl(item))
         .filter(Boolean)
         .slice(0, 24);
+    }
+    if (Array.isArray(rendering.files)) {
+      sanitized.files = rendering.files
+        .slice(0, 24)
+        .map((item) => ({
+          id: trimPersistText(item && item.id || '', 256),
+          name: trimPersistText(item && item.name || '', 256),
+          url: sanitizePersistUrl(item && item.url || ''),
+          mime: trimPersistText(item && item.mime || '', 128),
+          contentType: trimPersistText(item && item.contentType || '', 64),
+          size: Number(item && item.size || 0) || 0,
+          thumbnailUrl: sanitizePersistUrl(item && item.thumbnailUrl || ''),
+          thumbnailDarkUrl: sanitizePersistUrl(item && item.thumbnailDarkUrl || '')
+        }))
+        .filter((item) => item.url);
     }
     const rawModelResponse = rendering.rawModelResponse && typeof rendering.rawModelResponse === 'object'
       ? rendering.rawModelResponse
@@ -193,7 +335,12 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
           caption: trimPersistText(item && item.caption || '', 512),
           sourceHref: sanitizePersistUrl(item && item.sourceHref || ''),
           sourceLabel: trimPersistText(item && item.sourceLabel || '', 256),
-          fallbackSrc: sanitizePersistUrl(item && item.fallbackSrc || '')
+          fallbackSrc: sanitizePersistUrl(item && item.fallbackSrc || ''),
+          kind: trimPersistText(item && item.kind || '', 32),
+          name: trimPersistText(item && item.name || '', 256),
+          mime: trimPersistText(item && item.mime || '', 128),
+          contentType: trimPersistText(item && item.contentType || '', 64),
+          size: Number(item && item.size || 0) || 0
         })).filter((item) => item.src || item.cardId)
         : []
     };
@@ -211,25 +358,13 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
     return serialized;
   }
 
-  function buildSessionSnapshot(limitSessions = MAX_PERSIST_SESSIONS, activeOnly = false) {
+  function buildSessionSnapshot(activeOnly = false) {
     if (!sessionsData) return null;
     const sourceSessions = Array.isArray(sessionsData.sessions) ? sessionsData.sessions.slice() : [];
     sourceSessions.sort((a, b) => Number(b && b.updatedAt || 0) - Number(a && a.updatedAt || 0));
-    let picked = sourceSessions;
-    if (activeOnly) {
-      picked = sourceSessions.filter((session) => session && session.id === sessionsData.activeId);
-    } else if (limitSessions > 0 && sourceSessions.length > limitSessions) {
-      const activeId = sessionsData.activeId;
-      const selected = sourceSessions.slice(0, limitSessions);
-      if (activeId && !selected.some((session) => session && session.id === activeId)) {
-        const activeSession = sourceSessions.find((session) => session && session.id === activeId);
-        if (activeSession) {
-          selected.pop();
-          selected.push(activeSession);
-        }
-      }
-      picked = selected;
-    }
+    const picked = activeOnly
+      ? sourceSessions.filter((session) => session && session.id === sessionsData.activeId)
+      : sourceSessions;
     return {
       activeId: sessionsData.activeId,
       sessions: picked.map((session) => ({
@@ -243,7 +378,7 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
     const now = Date.now();
     if (now - lastStorageErrorToastAt < 2500) return;
     lastStorageErrorToastAt = now;
-    toast('会话保存失败，已自动精简本地缓存', 'error');
+    toast('会话保存失败，已切换到临时恢复模式', 'error');
   }
 
   function saveFallbackSession(snapshot) {
@@ -264,37 +399,145 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
     }
   }
 
-  function saveSessions() {
-    if (!sessionsData) return;
-    const attempts = [
-      buildSessionSnapshot(MAX_PERSIST_SESSIONS, false),
-      buildSessionSnapshot(6, false),
-      buildSessionSnapshot(1, true)
-    ].filter(Boolean);
+  function cloneMessages(messages) {
+    return Array.isArray(messages) ? messages.map((item) => ({ ...item })) : [];
+  }
+
+  function normalizeRuntimeMessage(message, index = 0) {
+    if (!message || typeof message !== 'object') return message;
+    const createdAt = Number(message.createdAt || message.updatedAt || 0) || Date.now() + index;
+    const updatedAt = Number(message.updatedAt || createdAt) || createdAt;
+    const order = Number(message.order);
+    return {
+      ...message,
+      id: String(message.id || generateId()),
+      createdAt,
+      updatedAt,
+      order: Number.isFinite(order) ? order : index
+    };
+  }
+
+  function normalizeRuntimeMessages(messages) {
+    return Array.isArray(messages)
+      ? messages.map((item, index) => normalizeRuntimeMessage(item, index)).filter(Boolean)
+      : [];
+  }
+
+  function buildSessionMeta(session) {
+    if (!session || typeof session !== 'object') return null;
+    return {
+      id: session.id,
+      title: session.title || '新会话',
+      model: session.model || '',
+      grokConversationId: session.grokConversationId || '',
+      grokParentResponseId: session.grokParentResponseId || '',
+      createdAt: Number(session.createdAt || 0) || Date.now(),
+      updatedAt: Number(session.updatedAt || 0) || Date.now(),
+      isDefaultTitle: session.isDefaultTitle !== false,
+      unread: Boolean(session.unread)
+    };
+  }
+
+  function setActiveSessionHint(sessionId) {
     try {
-      let saved = false;
-      for (const snapshot of attempts) {
-        try {
-          localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
-          clearFallbackSession();
-          saved = true;
-          break;
-        } catch (e) {
-          // 继续尝试更小的快照
-        }
-      }
-      if (!saved) {
-        const fallbackSnapshot = buildSessionSnapshot(1, true);
+      localStorage.setItem(ACTIVE_SESSION_STORAGE_KEY, sessionId || '');
+    } catch (e) {
+      // ignore storage errors
+    }
+  }
+
+  function clearLegacySessionSnapshot() {
+    try {
+      localStorage.removeItem(STORAGE_KEY);
+      localStorage.setItem(LEGACY_MIGRATED_KEY, '1');
+    } catch (e) {
+      // ignore storage errors
+    }
+    clearFallbackSession();
+  }
+
+  function enqueueStorageWork(work) {
+    storageQueue = storageQueue
+      .then(() => work())
+      .catch((error) => {
+        storageFallbackMode = true;
+        const fallbackSnapshot = buildSessionSnapshot(true);
         if (!saveFallbackSession(fallbackSnapshot)) {
           notifyStorageFailure();
         }
-      }
-    } catch (e) {
-      const fallbackSnapshot = buildSessionSnapshot(1, true);
+        console.warn('chat session storage failed', error);
+      });
+    return storageQueue;
+  }
+
+  function persistSessionMeta(session) {
+    const meta = buildSessionMeta(session);
+    if (!meta || !meta.id || storageFallbackMode) return;
+    void enqueueStorageWork(async () => {
+      await chatSessionStore.saveSession(meta);
+    });
+  }
+
+  function persistMessageRecord(sessionId, message, orderHint = 0) {
+    if (!sessionId || !message || storageFallbackMode) return;
+    const normalized = serializeMessage(normalizeRuntimeMessage(message, orderHint));
+    void enqueueStorageWork(async () => {
+      await chatSessionStore.saveMessage(sessionId, normalized, orderHint);
+    });
+  }
+
+  function persistSessionMessages(session) {
+    if (!session || !session.id || storageFallbackMode) return;
+    const normalizedMessages = normalizeRuntimeMessages(session.messages).map((message) => serializeMessage(message));
+    void enqueueStorageWork(async () => {
+      await chatSessionStore.saveMessages(session.id, normalizedMessages);
+    });
+  }
+
+  function saveSessions() {
+    if (!sessionsData) return;
+    const sessionMetas = Array.isArray(sessionsData.sessions)
+      ? sessionsData.sessions.map((session) => buildSessionMeta(session)).filter(Boolean)
+      : [];
+    setActiveSessionHint(sessionsData.activeId || '');
+    if (storageFallbackMode) {
+      const fallbackSnapshot = buildSessionSnapshot(true);
       if (!saveFallbackSession(fallbackSnapshot)) {
         notifyStorageFailure();
       }
+      return;
     }
+    void enqueueStorageWork(async () => {
+      await chatSessionStore.saveSessions(sessionMetas);
+      await chatSessionStore.setMeta('activeSessionId', sessionsData.activeId || '');
+      await chatSessionStore.setMeta('schemaVersion', STORAGE_SCHEMA_VERSION);
+      clearFallbackSession();
+      clearLegacySessionSnapshot();
+    });
+  }
+
+  async function readLegacySnapshot() {
+    let snapshot = null;
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) snapshot = JSON.parse(raw);
+    } catch (e) {
+      snapshot = null;
+    }
+    if (!snapshot) {
+      try {
+        const fallbackRaw = sessionStorage.getItem(SESSION_STORAGE_FALLBACK_KEY);
+        if (fallbackRaw) snapshot = JSON.parse(fallbackRaw);
+      } catch (e) {
+        snapshot = null;
+      }
+    }
+    if (!snapshot || !Array.isArray(snapshot.sessions) || !snapshot.sessions.length) return null;
+    snapshot.sessions = snapshot.sessions.map((session) => ({
+      ...session,
+      messages: normalizeRuntimeMessages(session.messages)
+    }));
+    return snapshot;
   }
 
   function getActiveSession() {
@@ -302,24 +545,126 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
     return sessionsData.sessions.find((s) => s.id === sessionsData.activeId) || null;
   }
 
-  function trimMessageHistory(maxCount = MAX_CONTEXT_MESSAGES) {
-    if (!maxCount || maxCount <= 0) return;
-    if (messageHistory.length <= maxCount) return;
-    messageHistory = messageHistory.slice(-maxCount);
-    const session = getActiveSession();
-    if (session) {
-      session.messages = messageHistory.slice();
-      session.updatedAt = Date.now();
-      saveSessions();
-      renderSessionList();
+  async function ensureSessionMessagesLoaded(session) {
+    if (!session) return [];
+    if (session.messagesLoaded) {
+      if (!Array.isArray(session.messages)) session.messages = [];
+      return session.messages;
+    }
+    if (storageFallbackMode) {
+      session.messages = normalizeRuntimeMessages(session.messages);
+      session.messagesLoaded = true;
+      return session.messages;
+    }
+    try {
+      const messages = await chatSessionStore.getSessionMessages(session.id);
+      session.messages = normalizeRuntimeMessages(messages);
+      session.messagesLoaded = true;
+      return session.messages;
+    } catch (e) {
+      console.warn('load session messages failed', e);
+      storageFallbackMode = true;
+      session.messages = normalizeRuntimeMessages(session.messages);
+      session.messagesLoaded = true;
+      return session.messages;
     }
   }
 
-  function restoreActiveSession() {
+  function getMessageOrderBase(session) {
+    if (!session || !Array.isArray(session.messages) || !session.messages.length) return 0;
+    return session.messages.reduce((maxOrder, message, index) => {
+      const candidate = Number(message && message.order);
+      return Number.isFinite(candidate) ? Math.max(maxOrder, candidate) : Math.max(maxOrder, index);
+    }, -1) + 1;
+  }
+
+  async function buildUserAttachmentsFromContent(content) {
+    if (!Array.isArray(content)) return [];
+    const results = [];
+    for (const block of content) {
+      if (!block || typeof block !== 'object') continue;
+      if (block.type === 'image_url') {
+        const attachmentId = getImageBlockAttachmentId(block);
+        if (attachmentId) {
+          const preview = await resolveStoredAttachmentPreview(attachmentId);
+          if (preview) {
+            results.push({
+              ...preview,
+              name: block.name || preview.name || '图片附件',
+              mime: block.mime || preview.mime || 'image/jpeg',
+              size: Number(block.size || preview.size || 0) || 0
+            });
+            continue;
+          }
+          results.push({
+            mime: block.mime || 'image/jpeg',
+            name: block.name || '图片附件',
+            placeholder: true,
+            placeholderLabel: '图片附件未缓存'
+          });
+          continue;
+        }
+        const imageUrl = block.image_url && typeof block.image_url === 'object'
+          ? String(block.image_url.url || '').trim()
+          : '';
+        if (imageUrl) {
+          results.push({
+            mime: block.mime || 'image/jpeg',
+            name: block.name || 'image',
+            data: imageUrl,
+            size: Number(block.size || 0) || 0
+          });
+          continue;
+        }
+        results.push({
+          mime: block.mime || 'image/jpeg',
+          name: block.name || '图片附件',
+          placeholder: true,
+          placeholderLabel: '图片附件未缓存'
+        });
+      }
+      if (block.type === 'file') {
+        const attachmentId = getFileBlockAttachmentId(block);
+        if (attachmentId) {
+          const preview = await resolveStoredAttachmentPreview(attachmentId);
+          if (preview) {
+            results.push({
+              ...preview,
+              name: block.name || preview.name || 'file',
+              mime: block.mime || preview.mime || '',
+              size: Number(block.size || preview.size || 0) || 0
+            });
+            continue;
+          }
+          results.push({
+            mime: block.mime || '',
+            name: block.name || 'file',
+            placeholder: true,
+            placeholderLabel: '文件附件未缓存',
+            size: Number(block.size || 0) || 0
+          });
+          continue;
+        }
+        if (block.data || block.url) {
+          results.push({ mime: block.mime || '', name: block.name || 'file', data: block.data || block.url });
+          continue;
+        }
+        results.push({
+          mime: block.mime || '',
+          name: block.name || 'file',
+          placeholder: true,
+          placeholderLabel: '文件附件未缓存',
+          size: Number(block.size || 0) || 0
+        });
+      }
+    }
+    return results;
+  }
+
+  async function restoreActiveSession() {
     const session = getActiveSession();
     if (!session) return;
-    messageHistory = Array.isArray(session.messages) ? session.messages.slice() : [];
-    trimMessageHistory();
+    messageHistory = normalizeRuntimeMessages(session.messages);
     if (chatLog) chatLog.innerHTML = '';
     if (!messageHistory.length) {
       showEmptyState();
@@ -339,37 +684,7 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
           updateMessage(entry, text, true);
         }
       } else if (entry && msg.role === 'user') {
-        let msgAttachments = [];
-        if (Array.isArray(msg.content)) {
-            msgAttachments = msg.content
-                .filter(b => b && (b.type === 'image_url' || b.type === 'file'))
-                .map(b => {
-                    if (b.type === 'image_url' && b.image_url && b.image_url.url) {
-                      return { mime: 'image/jpeg', name: 'image', data: b.image_url.url };
-                    }
-                    if (b.type === 'image_url') {
-                      return {
-                        mime: 'image/jpeg',
-                        name: '图片附件',
-                        placeholder: true,
-                        placeholderLabel: '图片附件未缓存'
-                      };
-                    }
-                    if (b.type === 'file' && (b.data || b.url)) {
-                      return { mime: b.mime || '', name: b.name || 'file', data: b.data || b.url };
-                    }
-                    if (b.type === 'file') {
-                      return {
-                        mime: b.mime || '',
-                        name: b.name || 'file',
-                        placeholder: true,
-                        placeholderLabel: '文件附件未缓存',
-                        size: Number(b.size || 0) || 0
-                      };
-                    }
-                    return null;
-                }).filter(Boolean);
-        }
+        const msgAttachments = await buildUserAttachmentsFromContent(msg.content);
         renderUserMessage(entry, text, msgAttachments);
       }
     }
@@ -382,7 +697,8 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
   function syncCurrentSession() {
     const session = getActiveSession();
     if (!session) return;
-    session.messages = messageHistory.slice();
+    session.messages = normalizeRuntimeMessages(cloneMessages(messageHistory));
+    session.messagesLoaded = true;
     session.updatedAt = Date.now();
   }
 
@@ -440,7 +756,8 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
   function syncSessionModel() {
     const session = getActiveSession();
     if (!session) return;
-    session.model = (modelSelect && modelSelect.value) || '';
+    const nextModel = (modelSelect && modelSelect.value) || '';
+    session.model = nextModel;
   }
 
   function restoreSessionModel() {
@@ -498,9 +815,13 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
       id,
       title: '新会话',
       isDefaultTitle: true,
+      model: (modelSelect && modelSelect.value) || '',
+      grokConversationId: '',
+      grokParentResponseId: '',
       createdAt: Date.now(),
       updatedAt: Date.now(),
-      messages: []
+      messages: [],
+      messagesLoaded: true
     };
     sessionsData.sessions.unshift(session);
     sessionsData.activeId = id;
@@ -512,47 +833,17 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
     if (isMobileSidebar()) closeSidebar();
   }
 
-  function collectChatUploadCacheNames(session) {
+  function collectChatAttachmentIds(session) {
     const picked = new Set();
     if (!session || !Array.isArray(session.messages)) return [];
 
-    const tryCollectFromUrl = (value) => {
-      const text = String(value || '').trim();
-      if (!text) return;
-      const matches = text.match(/chat-upload-[a-z0-9]+\.[a-z0-9]+/ig);
-      if (matches) {
-        matches.forEach((name) => picked.add(name));
-      }
-    };
-
     const collectFromBlocks = (content) => {
-      if (typeof content === 'string') {
-        tryCollectFromUrl(content);
-        return;
-      }
       if (!Array.isArray(content)) return;
       content.forEach((block) => {
         if (!block || typeof block !== 'object') return;
-        if (block.cacheName) {
-          tryCollectFromUrl(block.cacheName);
-        }
-        if (block.url) {
-          tryCollectFromUrl(block.url);
-        }
-        if (block.data && typeof block.data === 'string' && !String(block.data).startsWith('data:')) {
-          tryCollectFromUrl(block.data);
-        }
         if (block.type === 'image_url') {
-          const imageUrl = block.image_url && typeof block.image_url === 'object'
-            ? block.image_url.url
-            : '';
-          tryCollectFromUrl(imageUrl);
-        }
-        if (block.type === 'file') {
-          const fileData = block.file && typeof block.file === 'object'
-            ? block.file.file_data
-            : '';
-          tryCollectFromUrl(fileData);
+          const attachmentId = getImageBlockAttachmentId(block);
+          if (attachmentId) picked.add(attachmentId);
         }
       });
     };
@@ -568,45 +859,19 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
     return Array.from(picked);
   }
 
-  async function deleteChatUploadCache(files) {
-    const names = Array.isArray(files)
-      ? Array.from(new Set(files.map((item) => String(item || '').trim()).filter((name) => /^chat-upload-/i.test(name))))
-      : [];
-    if (!names.length) return;
-
-    let headers = { 'Content-Type': 'application/json' };
-    try {
-      const authHeader = await ensurePublicKey();
-      headers = {
-        ...headers,
-        ...buildAuthHeaders(authHeader)
-      };
-    } catch (e) {
-      // ignore auth helper failures
-    }
-
-    const res = await fetch('/v1/public/chat/delete-upload-cache', {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ files: names })
-    });
-    if (!res.ok) {
-      throw new Error('删除聊天上传缓存失败');
-    }
-  }
-
   async function deleteSession(id) {
     if (!sessionsData) return;
     const idx = sessionsData.sessions.findIndex((s) => s.id === id);
     if (idx === -1) return;
     const targetSession = sessionsData.sessions[idx];
-    const cacheNames = collectChatUploadCacheNames(targetSession);
-    try {
-      await deleteChatUploadCache(cacheNames);
-    } catch (e) {
-      console.warn('deleteSession cache cleanup failed', e);
-    }
+    await ensureSessionMessagesLoaded(targetSession);
+    collectChatAttachmentIds(targetSession).forEach(revokeAttachmentObjectUrl);
     sessionsData.sessions.splice(idx, 1);
+    if (!storageFallbackMode) {
+      void enqueueStorageWork(async () => {
+        await chatSessionStore.deleteSession(id);
+      });
+    }
     if (!sessionsData.sessions.length) {
       createSession();
       return;
@@ -614,21 +879,28 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
     if (sessionsData.activeId === id) {
       const newIdx = Math.min(idx, sessionsData.sessions.length - 1);
       sessionsData.activeId = sessionsData.sessions[newIdx].id;
-      restoreActiveSession();
+      await ensureSessionMessagesLoaded(sessionsData.sessions[newIdx]);
+      await restoreActiveSession();
       restoreSessionModel();
     }
     saveSessions();
     renderSessionList();
   }
 
-  function switchSession(id) {
+  async function switchSession(id) {
     if (!sessionsData || sessionsData.activeId === id) return;
     syncCurrentSession();
+    const previousSession = getActiveSession();
+    if (previousSession) {
+      persistSessionMeta(previousSession);
+      persistSessionMessages(previousSession);
+    }
     syncSessionModel();
     sessionsData.activeId = id;
     const target = getActiveSession();
+    await ensureSessionMessagesLoaded(target);
     if (target) target.unread = false;
-    restoreActiveSession();
+    await restoreActiveSession();
     restoreSessionModel();
     saveSessions();
     renderSessionList();
@@ -637,6 +909,33 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
 
   function isMobileSidebar() {
     return window.matchMedia('(max-width: 1024px)').matches;
+  }
+
+  function restoreElementHome(element, home) {
+    if (!element || !home || !home.parent) return;
+    if (element.parentNode === home.parent) return;
+    home.parent.insertBefore(element, home.next && home.next.parentNode === home.parent ? home.next : null);
+  }
+
+  function syncSidebarLayer() {
+    if (isMobileSidebar()) {
+      if (sidebarOverlay && sidebarOverlay.parentElement !== document.body) {
+        document.body.appendChild(sidebarOverlay);
+      }
+      if (chatSidebar && chatSidebar.parentElement !== document.body) {
+        document.body.appendChild(chatSidebar);
+      }
+      return;
+    }
+    if (chatSidebar) {
+      chatSidebar.classList.remove('open');
+    }
+    if (sidebarOverlay) {
+      sidebarOverlay.classList.remove('open');
+    }
+    document.body.classList.remove('sidebar-open');
+    restoreElementHome(chatSidebar, sidebarHome);
+    restoreElementHome(sidebarOverlay, sidebarOverlayHome);
   }
 
   function setSidebarCollapsed(collapsed) {
@@ -651,24 +950,31 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
   }
 
   function openSidebar() {
+    syncSidebarLayer();
     if (isMobileSidebar()) {
       if (chatSidebar) chatSidebar.classList.add('open');
       if (sidebarOverlay) sidebarOverlay.classList.add('open');
+      document.body.classList.add('sidebar-open');
       return;
     }
+    document.body.classList.remove('sidebar-open');
     setSidebarCollapsed(false);
   }
 
   function closeSidebar() {
+    syncSidebarLayer();
     if (isMobileSidebar()) {
       if (chatSidebar) chatSidebar.classList.remove('open');
       if (sidebarOverlay) sidebarOverlay.classList.remove('open');
+      document.body.classList.remove('sidebar-open');
       return;
     }
+    document.body.classList.remove('sidebar-open');
     setSidebarCollapsed(true);
   }
 
   function toggleSidebar() {
+    syncSidebarLayer();
     if (isMobileSidebar()) {
       if (chatSidebar && chatSidebar.classList.contains('open')) {
         closeSidebar();
@@ -683,6 +989,7 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
   }
 
   function restoreSidebarState() {
+    syncSidebarLayer();
     try {
       const raw = localStorage.getItem(SIDEBAR_STATE_KEY);
       setSidebarCollapsed(raw === '1');
@@ -691,34 +998,48 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
     }
   }
 
-  function loadSessions() {
+  async function loadSessions() {
+    let state = null;
     try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) {
-        sessionsData = JSON.parse(raw);
-        if (!sessionsData || !Array.isArray(sessionsData.sessions)) {
-          sessionsData = null;
+      await chatSessionStore.openDatabase();
+      await Promise.all([
+        chatSessionStore.requestPersistentStorage(),
+        chatSessionStore.estimateStorage()
+      ]);
+      state = await chatSessionStore.getState();
+      if (!state.sessions.length) {
+        const legacySnapshot = await readLegacySnapshot();
+        if (legacySnapshot) {
+          await chatSessionStore.importLegacySnapshot(legacySnapshot);
+          clearLegacySessionSnapshot();
+          state = {
+            activeId: legacySnapshot.activeId,
+            sessions: legacySnapshot.sessions.map((session) => ({
+              ...buildSessionMeta(session),
+              messages: session.messages,
+              messagesLoaded: true
+            }))
+          };
         }
       }
     } catch (e) {
-      sessionsData = null;
-    }
-    if (!sessionsData) {
-      try {
-        const fallbackRaw = sessionStorage.getItem(SESSION_STORAGE_FALLBACK_KEY);
-        if (fallbackRaw) {
-          sessionsData = JSON.parse(fallbackRaw);
-          if (!sessionsData || !Array.isArray(sessionsData.sessions)) {
-            sessionsData = null;
-          }
-        }
-      } catch (e) {
-        sessionsData = null;
+      console.warn('load IndexedDB sessions failed', e);
+      storageFallbackMode = true;
+      const legacySnapshot = await readLegacySnapshot();
+      if (legacySnapshot) {
+        state = {
+          activeId: legacySnapshot.activeId,
+          sessions: legacySnapshot.sessions.map((session) => ({
+            ...buildSessionMeta(session),
+            messages: normalizeRuntimeMessages(session.messages),
+            messagesLoaded: true
+          }))
+        };
       }
     }
-    if (!sessionsData || !sessionsData.sessions.length) {
+    if (!state || !Array.isArray(state.sessions) || !state.sessions.length) {
       const id = generateId();
-      sessionsData = {
+      state = {
         activeId: id,
         sessions: [{
           id,
@@ -726,25 +1047,52 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
           isDefaultTitle: true,
           createdAt: Date.now(),
           updatedAt: Date.now(),
-          messages: []
+          model: '',
+          grokConversationId: '',
+          grokParentResponseId: '',
+          unread: false,
+          messages: [],
+          messagesLoaded: true
         }]
       };
-      saveSessions();
     }
-    sessionsData.sessions.forEach((session) => {
-      if (session && typeof session.isDefaultTitle === 'undefined') {
-        session.isDefaultTitle = isDefaultTitleValue(session.title);
+    sessionsData = {
+      activeId: state.activeId,
+      sessions: state.sessions.map((session) => ({
+        id: session.id,
+        title: session.title || '新会话',
+        model: session.model || '',
+        grokConversationId: session.grokConversationId || '',
+        grokParentResponseId: session.grokParentResponseId || '',
+        isDefaultTitle: typeof session.isDefaultTitle === 'undefined'
+          ? isDefaultTitleValue(session.title)
+          : session.isDefaultTitle !== false,
+        createdAt: Number(session.createdAt || 0) || Date.now(),
+        updatedAt: Number(session.updatedAt || 0) || Date.now(),
+        unread: Boolean(session.unread),
+        messages: normalizeRuntimeMessages(session.messages),
+        messagesLoaded: Boolean(session.messagesLoaded)
+      }))
+    };
+    if (!sessionsData.activeId || !sessionsData.sessions.find((s) => s.id === sessionsData.activeId)) {
+      try {
+        const hinted = localStorage.getItem(ACTIVE_SESSION_STORAGE_KEY);
+        if (hinted && sessionsData.sessions.find((s) => s.id === hinted)) {
+          sessionsData.activeId = hinted;
+        }
+      } catch (e) {
+        sessionsData.activeId = sessionsData.sessions[0].id;
       }
-      if (!Array.isArray(session.messages)) {
-        session.messages = [];
-      }
-    });
+    }
     if (!sessionsData.activeId || !sessionsData.sessions.find((s) => s.id === sessionsData.activeId)) {
       sessionsData.activeId = sessionsData.sessions[0].id;
     }
-    restoreActiveSession();
+    const activeSession = getActiveSession();
+    await ensureSessionMessagesLoaded(activeSession);
+    await restoreActiveSession();
     restoreSessionModel();
     renderSessionList();
+    saveSessions();
   }
 
   function toast(message, type) {
@@ -1103,7 +1451,7 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
 
   function buildRenderedImageMarkdown(card) {
     let image = card && card.image && typeof card.image === 'object' ? card.image : null;
-    let original = image ? String(image.original || image.link || '').trim() : '';
+    let original = image ? String(image.original || image.thumbnail || '').trim() : '';
     let title = image ? normalizeSourceText(image.title || '') : '';
     
     if (!original && card && card.image_chunk) {
@@ -1114,7 +1462,9 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
     }
     if (original && !original.startsWith('http')) {
         let basePath = original.startsWith('/') ? original : '/' + original;
-        original = '/v1/files/image' + basePath;
+        original = basePath.startsWith('/users/')
+          ? '/v1/files/asset' + basePath
+          : '/v1/files/image' + basePath;
     }
     
     if (!original) return '';
@@ -1130,7 +1480,10 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
       const articleUrl = image ? String(image.link || '').trim() : '';
       const originalUrl = image ? String(image.original || '').trim() : '';
       const thumbnailUrl = image ? String(image.thumbnail || '').trim() : '';
-      const resolvedUrl = articleUrl || originalUrl;
+      const chunkUrl = card && card.image_chunk && typeof card.image_chunk === 'object'
+        ? String(card.image_chunk.imageUrl || '').trim()
+        : '';
+      const resolvedUrl = articleUrl || originalUrl || thumbnailUrl || chunkUrl;
       if (!resolvedUrl) return;
       const sourceInfo = {
         href: resolvedUrl,
@@ -1139,7 +1492,11 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
       };
       [
         originalUrl,
+        thumbnailUrl,
+        chunkUrl,
         normalizeRenderedImageUrl(originalUrl),
+        normalizeRenderedImageUrl(thumbnailUrl),
+        normalizeRenderedImageUrl(chunkUrl),
         articleUrl
       ]
         .filter(Boolean)
@@ -1161,16 +1518,17 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
         const parsed = new URL(raw, window.location.origin);
         const host = String(parsed.hostname || '').toLowerCase();
         const path = String(parsed.pathname || '').trim();
-        const marker = '/v1/files/image/';
+        const fileMarkers = ['/v1/files/asset/', '/v1/files/image/', '/v1/files/video/', '/v1/files/file/'];
+        const marker = fileMarkers.find((item) => path.includes(item));
 
-        if (path.includes(marker)) {
+        if (marker) {
           return path.slice(path.indexOf(marker));
         }
         if (host === 'localhost' || host === '127.0.0.1') {
           return path || '';
         }
         if (host === 'assets.grok.com' && path) {
-          return `/v1/files/image${path.startsWith('/') ? path : `/${path}`}`;
+          return `/v1/files/asset${path.startsWith('/') ? path : `/${path}`}`;
         }
         return '';
       } catch (e) {
@@ -1178,9 +1536,18 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
       }
     }
     const basePath = raw.startsWith('/') ? raw : `/${raw}`;
-    return basePath.startsWith('/v1/files/image/')
-      ? basePath
-      : `/v1/files/image${basePath}`;
+    if (
+      basePath.startsWith('/v1/files/asset/')
+      || basePath.startsWith('/v1/files/image/')
+      || basePath.startsWith('/v1/files/video/')
+      || basePath.startsWith('/v1/files/file/')
+    ) {
+      return basePath;
+    }
+    if (basePath.startsWith('/users/')) {
+      return `/v1/files/asset${basePath}`;
+    }
+    return `/v1/files/image${basePath}`;
   }
 
   function collectRenderedImageUrlsFromCard(card) {
@@ -1195,15 +1562,6 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
     return urls
       .map((item) => normalizeRenderedImageUrl(item))
       .filter(Boolean);
-  }
-
-  function blobToDataUrl(blob) {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(String(reader.result || ''));
-      reader.onerror = () => reject(reader.error || new Error('读取图片失败'));
-      reader.readAsDataURL(blob);
-    });
   }
 
   function inferImageExtension(mime, fallbackUrl) {
@@ -1233,6 +1591,7 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
         mime,
         name: `grok-image-${index + 1}.${ext}`,
         data,
+        blob,
         source: 'assistant'
       };
     } catch (e) {
@@ -1295,12 +1654,17 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
       toast('引用图片失败', 'error');
       return;
     }
-    imageAttachments.forEach((item) => {
-      attachments.push({
-        ...item,
-        name: buildUniqueFileName(item.name || 'image')
-      });
-    });
+    for (const item of imageAttachments) {
+      const safeName = buildUniqueFileName(item.name || 'image');
+      if (item.blob instanceof Blob) {
+        attachments.push(await saveChatImageAttachment(item.blob, safeName));
+      } else {
+        attachments.push({
+          ...item,
+          name: safeName
+        });
+      }
+    }
     showAttachmentBadge();
     if (promptInput) {
       promptInput.focus();
@@ -1531,7 +1895,7 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
           ? `<a class="message-image-source" href="${sourceHref}" target="_blank" rel="noopener noreferrer" title="${sourceHref}">${sourceLabel}</a>`
           : '';
         const fallbackAttr = fallbackSrc ? ` data-fallback-src="${fallbackSrc}"` : '';
-        return `<figure class="message-image-card"><img src="${safeUrl}" alt="${safeAlt}" loading="lazy" referrerpolicy="no-referrer" crossorigin="anonymous"${fallbackAttr}>${sourceBadge}${caption}</figure>`;
+        return `<figure class="message-image-card"><img src="${safeUrl}" alt="${safeAlt}" loading="lazy"${fallbackAttr}>${sourceBadge}${caption}</figure>`;
       });
 
       output = output.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (match, label, url) => {
@@ -1866,9 +2230,16 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
     if (!sections.length) {
       return renderBasicMarkdown(text, imageSourceMap);
     }
-    const renderThinkAgentSummary = (title) => {
+    const getThinkAgentBadge = (title, index) => {
+      const match = String(title || '').match(/Agent\s*(\d+)/i);
+      if (match) return match[1];
+      return String(index);
+    };
+
+    const renderThinkAgentSummary = (title, index) => {
       const safeTitle = escapeHtml(title);
-      return `<summary><span class="think-agent-avatar" aria-hidden="true"></span><span class="think-agent-label">${safeTitle}</span></summary>`;
+      const safeBadge = escapeHtml(getThinkAgentBadge(title, index));
+      return `<span class="think-agent-trigger"><span class="think-agent-avatar" aria-hidden="true"><span class="think-agent-number">${safeBadge}</span></span><span class="think-agent-label">${safeTitle}</span></span>`;
     };
     const renderGroups = (blocks, openAllGroups) => {
       const groups = [];
@@ -1897,28 +2268,47 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
       }).join('');
     };
 
-    const agentBlocks = sections.map((section, idx) => {
+    const renderAgentCard = (agent, index, isActive = false) => {
+      const activeAttr = isActive ? ' data-active="true"' : '';
+      const safeTitle = escapeHtml(agent.title);
+      const inner = agent.body || '<em>（空）</em>';
+      return `<div class="think-agent" role="button" tabindex="0" data-agent-index="${index}" aria-label="${safeTitle}" title="${safeTitle}" style="--agent-order: ${index};"${activeAttr}>${renderThinkAgentSummary(agent.title, index)}<template class="think-agent-template">${inner}</template></div>`;
+    };
+
+    const agentItems = [];
+    sections.forEach((section) => {
       const blocks = parseRolloutBlocks(section.lines.join('\n'), section.title || 'General');
       if (!section.title && blocks.length) {
         const synthetic = splitBlocksIntoSyntheticAgents(blocks);
         if (synthetic.length) {
-          return synthetic.map((agent, agentIdx) => {
+          synthetic.forEach((agent) => {
             const inner = renderFlatBlocks(agent.blocks, imageSourceMap);
-            const openAttr = openAll ? ' open' : (idx === 0 && agentIdx === 0 ? ' open' : '');
-            return `<details class="think-agent"${openAttr}>${renderThinkAgentSummary(agent.title)}<div class="think-agent-items">${inner}</div></details>`;
-          }).join('');
+            agentItems.push({ title: agent.title, body: inner });
+          });
+          return;
         }
       }
       const inner = blocks.length
         ? renderGroups(blocks, openAll)
         : `<div class="think-rollout-body">${renderBasicMarkdown(section.lines.join('\n').trim(), imageSourceMap)}</div>`;
       if (!section.title) {
-        return `<div class="think-agent-items">${inner}</div>`;
+        agentItems.push({ title: 'Grok Leader', body: inner });
+        return;
       }
-      const openAttr = openAll ? ' open' : (idx === 0 ? ' open' : '');
-      return `<details class="think-agent"${openAttr}>${renderThinkAgentSummary(section.title)}<div class="think-agent-items">${inner}</div></details>`;
+      agentItems.push({ title: section.title, body: inner });
     });
-    return `<div class="think-agents">${agentBlocks.join('')}</div>`;
+
+    if (agentItems.length > 4) {
+      const visible = agentItems.slice(0, 4);
+      const hiddenCount = agentItems.length - visible.length;
+      const avatars = visible
+        .map((agent, index) => `<span class="think-agent-stack-avatar" data-agent-index="${index}" title="${escapeHtml(agent.title)}" aria-hidden="true"><span class="think-agent-number">${escapeHtml(getThinkAgentBadge(agent.title, index))}</span></span>`)
+        .join('');
+      const cards = agentItems.map((agent, index) => renderAgentCard(agent, index, false)).join('');
+      return `<div class="think-agent-stack"><button type="button" class="think-agent-stack-toggle" aria-label="展开代理思考"><span class="think-agent-stack-avatars">${avatars}<span class="think-agent-stack-more">+${hiddenCount}</span></span></button><div class="think-agents">${cards}</div><button type="button" class="think-agent-stack-label">代理思考</button></div>`;
+    }
+
+    return `<div class="think-agents">${agentItems.map((agent, index) => renderAgentCard(agent, index, false)).join('')}</div>`;
   }
 
   function renderMarkdown(text, imageSourceMap = null) {
@@ -2020,6 +2410,26 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
     }
   }
 
+  function captureExpandedState(root, selector) {
+    if (!root || !root.querySelectorAll) return null;
+    const nodes = Array.from(root.querySelectorAll(selector));
+    if (!nodes.length) return null;
+    return nodes.map((node) => node.getAttribute('data-expanded') === 'true');
+  }
+
+  function restoreExpandedState(root, selector, states) {
+    if (!root || !root.querySelectorAll || !Array.isArray(states) || !states.length) return;
+    const nodes = Array.from(root.querySelectorAll(selector));
+    const max = Math.min(nodes.length, states.length);
+    for (let i = 0; i < max; i += 1) {
+      if (states[i]) {
+        nodes[i].setAttribute('data-expanded', 'true');
+      } else {
+        nodes[i].removeAttribute('data-expanded');
+      }
+    }
+  }
+
   function restoreScrollState(root, selector, states) {
     if (!root || !root.querySelectorAll || !Array.isArray(states) || !states.length) return;
     const nodes = Array.from(root.querySelectorAll(selector));
@@ -2081,10 +2491,9 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
       ? (fixedViewportAnchor || captureViewportAnchor(scrollContainer))
       : null;
     const savedThinkBlockState = captureOpenState(entry.contentNode, '.think-block');
-    const savedThinkAgentState = captureOpenState(entry.contentNode, '.think-agent');
+    const savedThinkAgentStackState = captureExpandedState(entry.contentNode, '.think-agent-stack');
     const savedRolloutState = captureOpenState(entry.contentNode, '.think-rollout-group');
     const savedThinkContentScroll = captureScrollState(entry.contentNode, '.think-content');
-    const savedThinkAgentItemsScroll = captureScrollState(entry.contentNode, '.think-agent-items');
     const savedThinkRolloutBodyScroll = captureScrollState(entry.contentNode, '.think-rollout-body');
     if (!entry.hasThink && entry.raw.includes('<think>')) {
       entry.hasThink = true;
@@ -2110,11 +2519,10 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
         mediaItems
       });
     restoreOpenState(entry.contentNode, '.think-block', savedThinkBlockState);
-    restoreOpenState(entry.contentNode, '.think-agent', savedThinkAgentState);
+    restoreExpandedState(entry.contentNode, '.think-agent-stack', savedThinkAgentStackState);
     restoreOpenState(entry.contentNode, '.think-rollout-group', savedRolloutState);
     if (shouldPreserveScroll) {
       restoreScrollState(entry.contentNode, '.think-content', savedThinkContentScroll);
-      restoreScrollState(entry.contentNode, '.think-agent-items', savedThinkAgentItemsScroll);
       restoreScrollState(entry.contentNode, '.think-rollout-body', savedThinkRolloutBodyScroll);
     }
     if (entry.hasThink) {
@@ -2586,10 +2994,99 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
     scheduleAssistantRender(entry);
   }
 
+  function attachGrokFileIdToContent(content, attachmentId, fileId) {
+    if (!Array.isArray(content) || !attachmentId || !fileId) return content;
+    return content.map((block) => {
+      if (!block || typeof block !== 'object') return block;
+      const blockAttachmentId = getImageBlockAttachmentId(block) || getFileBlockAttachmentId(block);
+      if (blockAttachmentId !== attachmentId) return block;
+      const next = { ...block, grokFileId: fileId };
+      if (next.type === 'image_url') {
+        const image = next.image_url && typeof next.image_url === 'object' ? { ...next.image_url } : {};
+        image.grok_file_id = fileId;
+        image.file_id = fileId;
+        next.image_url = image;
+      }
+      if (next.type === 'file') {
+        const file = next.file && typeof next.file === 'object' ? { ...next.file } : {};
+        file.grok_file_id = fileId;
+        file.file_id = fileId;
+        next.file = file;
+      }
+      return next;
+    });
+  }
+
+  function applyUploadedAttachmentMeta(session, uploadedItems) {
+    if (!session || !Array.isArray(uploadedItems) || !uploadedItems.length) return;
+    const byAttachment = new Map();
+    uploadedItems.forEach((item) => {
+      if (!item || typeof item !== 'object') return;
+      const attachmentId = String(item.attachmentId || '').trim();
+      const fileId = String(item.fileId || item.file_id || '').trim();
+      if (attachmentId && fileId) byAttachment.set(attachmentId, item);
+    });
+    if (!byAttachment.size || !Array.isArray(session.messages)) return;
+    session.messages = session.messages.map((message) => {
+      if (!message || message.role !== 'user' || !Array.isArray(message.content)) return message;
+      let content = message.content;
+      byAttachment.forEach((item, attachmentId) => {
+        content = attachGrokFileIdToContent(content, attachmentId, item.fileId || item.file_id);
+      });
+      return { ...message, content, updatedAt: Date.now() };
+    });
+    if (sessionsData && sessionsData.activeId === session.id) {
+      messageHistory = cloneMessages(session.messages);
+    }
+    byAttachment.forEach((item, attachmentId) => {
+      if (!storageFallbackMode && chatSessionStore.updateAttachmentMeta) {
+        void enqueueStorageWork(async () => {
+          await chatSessionStore.updateAttachmentMeta(attachmentId, {
+            grokFileId: item.fileId || item.file_id || '',
+            grokFileUri: item.fileUri || item.file_uri || '',
+            uploadedAt: Date.now()
+          });
+        });
+      }
+    });
+  }
+
+  function applyGrokMetadata(grokMeta, targetSessionId = null) {
+    if (!grokMeta || typeof grokMeta !== 'object' || !sessionsData) return;
+    const sessionId = targetSessionId || sessionsData.activeId;
+    const session = sessionsData.sessions.find((s) => s.id === sessionId);
+    if (!session) return;
+    const conversationId = String(grokMeta.conversationId || grokMeta.conversation_id || '').trim();
+    const parentResponseId = String(grokMeta.parentResponseId || grokMeta.parent_response_id || '').trim();
+    let changed = false;
+    if (conversationId && session.grokConversationId !== conversationId) {
+      session.grokConversationId = conversationId;
+      changed = true;
+    }
+    if (parentResponseId && session.grokParentResponseId !== parentResponseId) {
+      session.grokParentResponseId = parentResponseId;
+      changed = true;
+    }
+    const uploadedItems = Array.isArray(grokMeta.uploadedAttachments) ? grokMeta.uploadedAttachments : [];
+    if (uploadedItems.length) {
+      applyUploadedAttachmentMeta(session, uploadedItems);
+      changed = true;
+    }
+    if (changed) {
+      session.updatedAt = Date.now();
+      persistSessionMeta(session);
+      persistSessionMessages(session);
+      saveSessions();
+    }
+  }
+
   function upsertAssistantMessage(sessionId, messageId, assistantText, assistantSources = null, assistantRendering = null, committed = false, draftState = null) {
     if (!sessionId || !sessionsData || !messageId) return;
     const session = sessionsData.sessions.find((s) => s.id === sessionId);
     if (!session) return;
+    if (!Array.isArray(session.messages)) {
+      session.messages = [];
+    }
     const nextMessage = {
       id: messageId,
       role: 'assistant',
@@ -2597,7 +3094,10 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
       sources: assistantSources || null,
       rendering: assistantRendering || null,
       committed: Boolean(committed),
-      draftState: committed ? null : (draftState || null)
+      draftState: committed ? null : (draftState || null),
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      order: getMessageOrderBase(session)
     };
     const existingIndex = session.messages.findIndex((item) => item && item.role === 'assistant' && item.id === messageId);
     if (existingIndex >= 0) {
@@ -2608,16 +3108,19 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
     } else {
       session.messages.push(nextMessage);
     }
-    if (session.messages.length > MAX_CONTEXT_MESSAGES) {
-      session.messages = session.messages.slice(-MAX_CONTEXT_MESSAGES);
-    }
+    session.messages = normalizeRuntimeMessages(session.messages);
+    session.messagesLoaded = true;
     session.updatedAt = Date.now();
     updateSessionTitle(session);
     if (sessionsData.activeId === sessionId) {
-      messageHistory = session.messages.slice();
-      trimMessageHistory();
+      messageHistory = cloneMessages(session.messages);
     } else {
       session.unread = true;
+    }
+    const storedMessage = session.messages.find((item) => item && item.id === messageId);
+    persistSessionMeta(session);
+    if (storedMessage) {
+      persistMessageRecord(sessionId, storedMessage, existingIndex >= 0 ? storedMessage.order : session.messages.length - 1);
     }
     saveSessions();
     renderSessionList();
@@ -2770,14 +3273,14 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
       if (!block) return;
       if (!entry.thinkingActive) {
         block.removeAttribute('data-thinking');
-        node.style.removeProperty('--think-spin-delay');
+        block.style.removeProperty('--think-spin-delay');
         activeThinkSpinEntries.delete(entry);
         block.querySelectorAll('.think-agent-avatar, .think-rollout-avatar').forEach((avatar) => {
           avatar.style.removeProperty('transform');
         });
       } else {
         block.setAttribute('data-thinking', 'true');
-        node.style.setProperty('--think-spin-delay', spinOffset);
+        block.style.setProperty('--think-spin-delay', spinOffset);
         activeThinkSpinEntries.add(entry);
         ensureThinkSpinLoop();
       }
@@ -2797,8 +3300,9 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
         }
         const elapsedMs = Math.max(0, now - (entry.startedAt || now));
         const angle = ((elapsedMs % 2200) / 2200) * 360;
-        entry.contentNode.querySelectorAll('.think-block[data-thinking="true"] .think-agent-avatar, .think-block[data-thinking="true"] .think-rollout-avatar').forEach((avatar) => {
-          avatar.style.transform = `rotate(${angle}deg)`;
+        entry.contentNode.querySelectorAll('.think-block[data-thinking="true"] .think-rollout-avatar').forEach((avatar) => {
+          const rotate = `${angle}deg`;
+          avatar.style.transform = `rotate(${rotate})`;
         });
       });
       if (activeThinkSpinEntries.size) {
@@ -2919,6 +3423,92 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
       event.stopPropagation();
       expandInlineCitationCluster(target);
     });
+  }
+
+  function closeThinkAgentPopover() {
+    const popover = document.querySelector('.think-agent-popover');
+    if (popover) {
+      popover.setAttribute('data-closing', 'true');
+      setTimeout(() => {
+        if (popover.isConnected) {
+          popover.remove();
+        }
+      }, 180);
+    }
+    document.querySelectorAll('.think-agent[data-active="true"]').forEach((agent) => {
+      agent.removeAttribute('data-active');
+    });
+  }
+
+  function positionThinkAgentPopover(popover, agent) {
+    if (!popover || !agent) return;
+    const rect = agent.getBoundingClientRect();
+    const margin = 12;
+    const width = Math.min(620, Math.max(320, window.innerWidth - margin * 2));
+    const left = Math.min(Math.max(margin, rect.left), window.innerWidth - width - margin);
+    const belowTop = rect.bottom + 10;
+    const maxHeight = Math.min(520, Math.max(220, window.innerHeight - belowTop - margin));
+    popover.style.width = `${width}px`;
+    popover.style.left = `${left}px`;
+    popover.style.top = `${belowTop}px`;
+    popover.style.maxHeight = `${maxHeight}px`;
+    popover.style.setProperty('--popover-origin-x', `${Math.min(Math.max(rect.left + rect.width / 2 - left, 24), width - 24)}px`);
+    popover.style.setProperty('--popover-origin-y', '0px');
+  }
+
+  function openThinkAgentPopover(agent) {
+    if (!(agent instanceof HTMLElement)) return;
+    const template = agent.querySelector('.think-agent-template');
+    const html = template ? template.innerHTML : '';
+    const label = agent.querySelector('.think-agent-label');
+    const title = label ? label.textContent || '' : '';
+
+    closeThinkAgentPopover();
+    agent.setAttribute('data-active', 'true');
+
+    const popover = document.createElement('div');
+    popover.className = 'think-agent-popover';
+    popover.innerHTML = `<div class="think-agent-popover-header"><span class="think-agent-avatar" aria-hidden="true"></span><span class="think-agent-label">${escapeHtml(title)}</span></div><div class="think-agent-popover-body">${html || '<em>（空）</em>'}</div>`;
+    document.body.appendChild(popover);
+    positionThinkAgentPopover(popover, agent);
+    requestAnimationFrame(() => {
+      popover.setAttribute('data-ready', 'true');
+    });
+  }
+
+  let thinkAgentDrag = null;
+
+  function startThinkAgentsDrag(scroller, event) {
+    if (!(scroller instanceof HTMLElement)) return;
+    thinkAgentDrag = {
+      scroller,
+      x: event.clientX,
+      scrollLeft: scroller.scrollLeft,
+      moved: false
+    };
+    scroller.classList.add('is-dragging');
+  }
+
+  function moveThinkAgentsDrag(event) {
+    if (!thinkAgentDrag) return;
+    const delta = event.clientX - thinkAgentDrag.x;
+    if (Math.abs(delta) > 3) {
+      thinkAgentDrag.moved = true;
+      thinkAgentDrag.scroller.dataset.dragging = '1';
+    }
+    thinkAgentDrag.scroller.scrollLeft = thinkAgentDrag.scrollLeft - delta;
+  }
+
+  function endThinkAgentsDrag() {
+    if (!thinkAgentDrag) return;
+    const scroller = thinkAgentDrag.scroller;
+    scroller.classList.remove('is-dragging');
+    setTimeout(() => {
+      if (scroller.dataset.dragging === '1') {
+        delete scroller.dataset.dragging;
+      }
+    }, 0);
+    thinkAgentDrag = null;
   }
 
   function cleanExtractedUrl(url) {
@@ -3256,52 +3846,130 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
     return buildMessagesFrom(messageHistory);
   }
 
-  function sanitizeRequestContent(content) {
+  async function sanitizeRequestContent(content) {
     if (typeof content === 'string') return content;
     if (!Array.isArray(content)) return content;
-    return content.map((block) => {
-      if (!block || typeof block !== 'object') return null;
+    const mapped = [];
+    for (const block of content) {
+      if (!block || typeof block !== 'object') continue;
       if (block.type === 'text') {
         const text = String(block.text || '');
-        return text ? { type: 'text', text } : null;
+        if (text) mapped.push({ type: 'text', text });
+        continue;
       }
       if (block.type === 'image_url') {
+        const attachmentId = getImageBlockAttachmentId(block);
+        if (attachmentId) {
+          const dataUrl = await resolveStoredAttachmentDataUrl(attachmentId);
+          if (dataUrl) {
+            mapped.push({
+              type: 'image_url',
+              image_url: {
+                url: dataUrl,
+                grok_file_id: block.grokFileId || '',
+                file_id: block.grokFileId || ''
+              },
+              attachmentId,
+              name: block.name || block.filename || 'image',
+              mime: block.mime || 'image/jpeg',
+              size: Number(block.size || 0) || 0,
+              grokFileId: block.grokFileId || ''
+            });
+          } else {
+            throw new Error('图片附件未找到，无法继续发送该上下文');
+          }
+          continue;
+        }
         const imageUrl = block.image_url && typeof block.image_url === 'object'
           ? String(block.image_url.url || '').trim()
           : String(block.url || '').trim();
-        if (!imageUrl) return null;
-        return { type: 'image_url', image_url: { url: imageUrl } };
+        if (imageUrl) {
+          mapped.push({
+            type: 'image_url',
+            image_url: {
+              url: imageUrl,
+              grok_file_id: block.grokFileId || '',
+              file_id: block.grokFileId || ''
+            },
+            attachmentId: block.attachmentId || undefined,
+            name: block.name || block.filename || 'image',
+            mime: block.mime || 'image/jpeg',
+            size: Number(block.size || 0) || 0,
+            grokFileId: block.grokFileId || ''
+          });
+        }
+        continue;
       }
       if (block.type === 'file') {
+        const attachmentId = getFileBlockAttachmentId(block);
+        if (attachmentId) {
+          const dataUrl = await resolveStoredAttachmentDataUrl(attachmentId);
+          if (!dataUrl) {
+            throw new Error('文件附件未找到，无法继续发送该上下文');
+          }
+          mapped.push({
+            type: 'file',
+            file: {
+              file_data: dataUrl,
+              filename: block.name || block.filename || 'file',
+              mime_type: block.mime || '',
+              size: Number(block.size || 0) || 0,
+              grok_file_id: block.grokFileId || '',
+              file_id: block.grokFileId || ''
+            },
+            attachmentId
+          });
+          continue;
+        }
         const fileData = block.file && typeof block.file === 'object'
           ? String(block.file.file_data || '').trim()
           : String(block.url || block.data || '').trim();
-        if (!fileData) return null;
-        return { type: 'file', file: { file_data: fileData } };
+        if (fileData) {
+          mapped.push({
+            type: 'file',
+            file: {
+              file_data: fileData,
+              filename: block.name || block.filename || '',
+              mime_type: block.mime || '',
+              size: Number(block.size || 0) || 0,
+              grok_file_id: block.grokFileId || '',
+              file_id: block.grokFileId || ''
+            }
+          });
+        }
       }
-      return null;
-    }).filter(Boolean);
+    }
+    return mapped;
   }
 
-  function buildMessagesFrom(history) {
+  async function buildMessagesFrom(history) {
     const payload = [];
     const systemPrompt = systemInput ? systemInput.value.trim() : '';
     if (systemPrompt) {
       payload.push({ role: 'system', content: systemPrompt });
     }
     for (const msg of history) {
-      payload.push({ role: msg.role, content: sanitizeRequestContent(msg.content) });
+      payload.push({ role: msg.role, content: await sanitizeRequestContent(msg.content) });
     }
     return payload;
   }
 
-  function buildPayload() {
+  async function buildPayload() {
+    const session = getActiveSession();
     const payload = {
       model: (modelSelect && modelSelect.value) || 'grok-3',
-      messages: buildMessages(),
+      messages: await buildMessages(),
       stream: true,
       temperature: Number(tempRange ? tempRange.value : 0.8),
-      top_p: Number(topPRange ? topPRange.value : 0.95)
+      top_p: Number(topPRange ? topPRange.value : 0.95),
+      provider_options: {
+        grok: {
+          conversation_id: session ? session.grokConversationId || '' : '',
+          parent_response_id: session ? session.grokParentResponseId || '' : '',
+          reuse_conversation: true,
+          sources_mode: 'full'
+        }
+      }
     };
     const reasoning = reasoningSelect ? reasoningSelect.value : '';
     if (reasoning) {
@@ -3310,13 +3978,22 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
     return payload;
   }
 
-  function buildPayloadFrom(history) {
+  async function buildPayloadFrom(history) {
+    const session = getActiveSession();
     const payload = {
       model: (modelSelect && modelSelect.value) || 'grok-3',
-      messages: buildMessagesFrom(history),
+      messages: await buildMessagesFrom(history),
       stream: true,
       temperature: Number(tempRange ? tempRange.value : 0.8),
-      top_p: Number(topPRange ? topPRange.value : 0.95)
+      top_p: Number(topPRange ? topPRange.value : 0.95),
+      provider_options: {
+        grok: {
+          conversation_id: session ? session.grokConversationId || '' : '',
+          parent_response_id: session ? session.grokParentResponseId || '' : '',
+          reuse_conversation: true,
+          sources_mode: 'full'
+        }
+      }
     };
     const reasoning = reasoningSelect ? reasoningSelect.value : '';
     if (reasoning) {
@@ -3330,20 +4007,25 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
     modelPicker.classList.remove('open');
     modelPickerMenu.classList.add('hidden');
     modelPickerBtn.setAttribute('aria-expanded', 'false');
+    document.body.classList.remove('model-picker-open');
+    restoreModelPickerMenu();
   }
 
   function openModelPicker() {
     if (!modelPicker || !modelPickerMenu || !modelPickerBtn) return;
+    positionModelPickerMenu();
     modelPicker.classList.add('open');
     modelPickerMenu.classList.remove('hidden');
     modelPickerBtn.setAttribute('aria-expanded', 'true');
+    document.body.classList.add('model-picker-open');
   }
 
   function setModelValue(modelId) {
     if (!modelSelect || !modelId) return;
     modelSelect.value = modelId;
     if (modelPickerLabel) {
-      modelPickerLabel.textContent = modelId;
+      modelPickerLabel.textContent = formatModelLabel(modelId);
+      modelPickerLabel.title = modelId;
     }
     if (modelPickerMenu) {
       const options = modelPickerMenu.querySelectorAll('.model-option');
@@ -3364,6 +4046,43 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
     modelPickerMenu.innerHTML = '';
     availableModels = Array.isArray(models) ? models.slice() : [];
 
+    const quickModels = [
+      { id: 'grok-4.20-auto', title: 'Auto', subtitle: 'Chooses Fast or Expert' },
+      { id: 'grok-4.20-fast', title: 'Fast', subtitle: 'Powered by Grok 4.20' },
+      { id: 'grok-4.20-expert', title: 'Expert', subtitle: 'Powered by Grok 4.20' },
+      { id: 'grok-4.20-heavy', title: 'Heavy', subtitle: 'Team of Experts' }
+    ].filter((item) => availableModels.includes(item.id));
+
+    if (quickModels.length) {
+      const quickWrap = document.createElement('div');
+      quickWrap.className = 'model-quick-grid';
+
+      quickModels.forEach((item) => {
+        const quickBtn = document.createElement('button');
+        quickBtn.type = 'button';
+        quickBtn.className = 'model-option model-option-quick';
+        quickBtn.title = item.id;
+        quickBtn.dataset.value = item.id;
+        quickBtn.setAttribute('role', 'option');
+        quickBtn.innerHTML = `
+          <span class="model-option-title">${item.title}</span>
+          <span class="model-option-subtitle">${item.subtitle}</span>
+        `;
+        quickBtn.addEventListener('click', () => {
+          setModelValue(item.id);
+          closeModelPicker();
+        });
+        quickWrap.appendChild(quickBtn);
+      });
+
+      modelPickerMenu.appendChild(quickWrap);
+
+      const divider = document.createElement('div');
+      divider.className = 'model-option-divider';
+      divider.textContent = '其他模型';
+      modelPickerMenu.appendChild(divider);
+    }
+
     availableModels.forEach((id) => {
       const option = document.createElement('option');
       option.value = id;
@@ -3373,9 +4092,13 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.className = 'model-option';
-      btn.textContent = id;
+      btn.title = id;
       btn.dataset.value = id;
       btn.setAttribute('role', 'option');
+      btn.innerHTML = `
+        <span class="model-option-title">${formatModelLabel(id)}</span>
+        <span class="model-option-id">${id}</span>
+      `;
       btn.addEventListener('click', () => {
         setModelValue(id);
         closeModelPicker();
@@ -3386,7 +4109,7 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
 
   async function loadModels() {
     if (!modelSelect) return;
-    const fallback = ['grok-4.1-fast', 'grok-4', 'grok-3', 'grok-3-mini', 'grok-3-thinking', 'grok-4.20-fast', 'grok-4.20-expert', 'grok-4.20-auto', 'grok-4.3-beta'];
+    const fallback = ['grok-4.1-fast', 'grok-4', 'grok-3', 'grok-3-mini', 'grok-3-thinking', 'grok-4.20-fast', 'grok-4.20-expert', 'grok-4.20-auto'];
     const preferred = 'grok-4.20-auto';
     let list = fallback;
 
@@ -3401,7 +4124,7 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
         }
         return;
       }
-      const res = await fetch('/v1/models', {
+      const res = await fetch('/v1/public/models', {
         cache: 'no-store',
         headers: buildAuthHeaders(authHeader)
       });
@@ -3544,26 +4267,109 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
     });
   }
 
-  async function uploadCachedChatImage(file) {
-    const formData = new FormData();
-    formData.append('file', file, file.name || 'image');
-    let headers = {};
-    try {
-      const authHeader = await ensurePublicKey();
-      headers = buildAuthHeaders(authHeader);
-    } catch (e) {
-      // ignore auth helper failures
+  function positionModelPickerMenu() {
+    if (!modelPicker || !modelPickerMenu || !modelPickerBtn) return;
+    const isMobile = window.matchMedia('(max-width: 640px)').matches;
+    if (!isMobile) {
+      restoreModelPickerMenu();
+      return;
     }
-    const res = await fetch('/v1/public/chat/upload-image', {
-      method: 'POST',
-      headers,
-      body: formData
+    document.body.appendChild(modelPickerMenu);
+    const rect = modelPickerBtn.getBoundingClientRect();
+    const left = 12;
+    const right = 12;
+    const safeBottom = 12;
+    const bottomOffset = Math.max(window.innerHeight - rect.top + safeBottom, 88);
+    const maxHeight = Math.min(window.innerHeight * 0.52, Math.max(rect.top - 20, 220));
+    modelPickerMenu.style.left = `${left}px`;
+    modelPickerMenu.style.right = `${right}px`;
+    modelPickerMenu.style.top = 'auto';
+    modelPickerMenu.style.bottom = `${bottomOffset}px`;
+    modelPickerMenu.style.width = 'auto';
+    modelPickerMenu.style.maxHeight = `${maxHeight}px`;
+  }
+
+  function restoreModelPickerMenu() {
+    if (!modelPicker || !modelPickerMenu) return;
+    if (modelPickerMenu.parentElement !== modelPicker) {
+      modelPicker.appendChild(modelPickerMenu);
+    }
+    modelPickerMenu.style.left = '';
+    modelPickerMenu.style.right = '';
+    modelPickerMenu.style.top = '';
+    modelPickerMenu.style.bottom = '';
+    modelPickerMenu.style.width = '';
+    modelPickerMenu.style.maxHeight = '';
+  }
+
+  function formatModelLabel(modelId) {
+    const id = String(modelId || '').trim();
+    const friendly = {
+      'grok-4.20-auto': 'Grok 4.20 Auto',
+      'grok-4.20-fast': 'Grok 4.20 Fast',
+      'grok-4.20-expert': 'Grok 4.20 Expert',
+      'grok-4.20-heavy': 'Grok 4.20 Heavy',
+      'grok-4.20-multi-agent-0309': 'Grok 4.20 Multi-Agent',
+      'grok-4.20-0309': 'Grok 4.20 0309',
+      'grok-4.20-0309-reasoning': 'Grok 4.20 0309 Reasoning',
+      'grok-4.20-0309-non-reasoning': 'Grok 4.20 0309 Non-Reasoning',
+      'grok-4.20-0309-super': 'Grok 4.20 0309 Super',
+      'grok-4.20-0309-reasoning-super': 'Grok 4.20 0309 Reasoning Super',
+      'grok-4.20-0309-non-reasoning-super': 'Grok 4.20 0309 Non-Reasoning Super',
+      'grok-4.20-0309-heavy': 'Grok 4.20 0309 Heavy',
+      'grok-4.20-0309-reasoning-heavy': 'Grok 4.20 0309 Reasoning Heavy',
+      'grok-4.20-0309-non-reasoning-heavy': 'Grok 4.20 0309 Non-Reasoning Heavy',
+      'grok-4.1-fast': 'Grok 4.1 Fast',
+      'grok-4.1-expert': 'Grok 4.1 Expert',
+      'grok-4.1-mini': 'Grok 4.1 Mini',
+      'grok-4.1-thinking': 'Grok 4.1 Thinking'
+    };
+    return friendly[id] || id;
+  }
+
+  async function saveChatFileAttachment(file, safeName) {
+    if (!(file instanceof Blob)) {
+      throw new Error('文件内容不可用');
+    }
+    if (storageFallbackMode) {
+      const dataUrl = await blobToDataUrl(file);
+      return {
+        name: safeName,
+        data: dataUrl,
+        mime: file.type || '',
+        size: Number(file.size || 0) || 0,
+        stored: false
+      };
+    }
+    const activeSession = getActiveSession();
+    const sessionId = activeSession && activeSession.id ? activeSession.id : (sessionsData && sessionsData.activeId) || '';
+    const attachmentId = generateId();
+    await chatSessionStore.saveAttachment(sessionId, {
+      id: attachmentId,
+      name: safeName,
+      mime: file.type || '',
+      size: Number(file.size || 0) || 0,
+      blob: file,
+      createdAt: Date.now(),
+      updatedAt: Date.now()
     });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok || data.status !== 'success' || !data.url) {
-      throw new Error(data.detail || '图片缓存上传失败');
-    }
-    return data;
+    return {
+      name: safeName,
+      data: rememberAttachmentObjectUrl(attachmentId, file),
+      mime: file.type || '',
+      size: Number(file.size || 0) || 0,
+      attachmentId,
+      blob: file,
+      stored: true
+    };
+  }
+
+  async function saveChatImageAttachment(file, safeName) {
+    const item = await saveChatFileAttachment(file, safeName);
+    return {
+      ...item,
+      mime: item.mime || 'image/jpeg'
+    };
   }
 
   function buildUniqueFileName(name) {
@@ -3589,29 +4395,9 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
       const safeName = buildUniqueFileName(file.name || 'file');
       const isImage = String(file.type || '').startsWith('image/');
       if (isImage) {
-        const uploaded = await uploadCachedChatImage(file);
-        attachments.push({
-          name: safeName,
-          data: uploaded.url,
-          url: uploaded.url,
-          mime: uploaded.content_type || file.type || 'image/jpeg',
-          size: Number(uploaded.size_bytes || file.size || 0) || 0,
-          cached: true,
-          cacheName: uploaded.filename || ''
-        });
+        attachments.push(await saveChatImageAttachment(file, safeName));
       } else {
-        let dataUrl = '';
-        try {
-          dataUrl = await readFileAsDataUrl(file);
-        } catch (e) {
-          dataUrl = await readFileAsDataUrlFallback(file);
-        }
-        attachments.push({
-          name: safeName,
-          data: dataUrl,
-          mime: file.type || '',
-          size: Number(file.size || 0) || 0
-        });
+        attachments.push(await saveChatFileAttachment(file, safeName));
       }
       try {
         showAttachmentBadge();
@@ -3748,7 +4534,6 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
     fixedViewportAnchor = null;
 
     abortController = new AbortController();
-    const payload = buildPayloadFrom(historySlice);
 
     let headers = { 'Content-Type': 'application/json' };
     try {
@@ -3759,6 +4544,7 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
     }
 
     try {
+      const payload = await buildPayloadFrom(historySlice);
       const res = await fetch('/v1/public/chat/completions', {
         method: 'POST',
         headers,
@@ -3808,30 +4594,88 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
     const userEntry = createMessage('user', '');
     renderUserMessage(userEntry, prompt, attachmentsSnapshot);
 
+    const activeSession = getActiveSession();
     let content = prompt;
     if (attachments.length) {
       const blocks = [];
       if (prompt) {
         blocks.push({ type: 'text', text: prompt });
       }
-      attachments.forEach((item) => {
+      for (const item of attachments) {
         const isImage = String(item.mime || '').startsWith('image/');
         if (isImage) {
-          blocks.push({ type: 'image_url', image_url: { url: item.data } });
+          const attachmentId = String(item.attachmentId || '').trim();
+          if (attachmentId && item.blob instanceof Blob && !storageFallbackMode) {
+            await chatSessionStore.saveAttachment((activeSession && activeSession.id) || '', {
+              id: attachmentId,
+              name: item.name || 'image',
+              mime: item.mime || 'image/jpeg',
+              size: Number(item.size || item.blob.size || 0) || 0,
+              blob: item.blob,
+              createdAt: Date.now(),
+              updatedAt: Date.now()
+            });
+          }
+          blocks.push({
+            type: 'image_url',
+            image_url: { url: attachmentId ? buildIndexedDbAttachmentUrl(attachmentId) : item.data },
+            attachmentId: attachmentId || undefined,
+            name: item.name || 'image',
+            mime: item.mime || 'image/jpeg',
+            size: Number(item.size || 0) || 0,
+            grokFileId: item.grokFileId || ''
+          });
         } else {
-          blocks.push({ type: 'file', file: { file_data: item.data } });
+          const attachmentId = String(item.attachmentId || '').trim();
+          if (attachmentId && item.blob instanceof Blob && !storageFallbackMode) {
+            await chatSessionStore.saveAttachment((activeSession && activeSession.id) || '', {
+              id: attachmentId,
+              name: item.name || 'file',
+              mime: item.mime || item.blob.type || '',
+              size: Number(item.size || item.blob.size || 0) || 0,
+              blob: item.blob,
+              createdAt: Date.now(),
+              updatedAt: Date.now()
+            });
+          }
+          blocks.push({
+            type: 'file',
+            file: {
+              file_data: attachmentId ? buildIndexedDbAttachmentUrl(attachmentId) : item.data,
+              filename: item.name || 'file',
+              mime_type: item.mime || '',
+              size: Number(item.size || 0) || 0,
+              grok_file_id: item.grokFileId || '',
+              file_id: item.grokFileId || ''
+            },
+            attachmentId: attachmentId || undefined,
+            name: item.name || 'file',
+            mime: item.mime || '',
+            size: Number(item.size || 0) || 0,
+            grokFileId: item.grokFileId || ''
+          });
         }
-      });
+      }
       content = blocks;
     }
 
-    messageHistory.push({ role: 'user', content });
-    trimMessageHistory();
+    const nextOrder = getMessageOrderBase(activeSession);
+    const userMessage = normalizeRuntimeMessage({
+      id: generateId(),
+      role: 'user',
+      content,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      order: nextOrder
+    }, nextOrder);
+    messageHistory.push(userMessage);
     if (promptInput) promptInput.value = '';
     clearAttachment();
     syncCurrentSession();
     syncSessionModel();
     updateSessionTitle(getActiveSession());
+    persistMessageRecord(sessionsData ? sessionsData.activeId : '', userMessage, nextOrder);
+    persistSessionMeta(getActiveSession());
     saveSessions();
     renderSessionList();
 
@@ -3847,7 +4691,6 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
     fixedViewportAnchor = null;
 
     abortController = new AbortController();
-    const payload = buildPayload();
 
     let headers = { 'Content-Type': 'application/json' };
     try {
@@ -3858,6 +4701,7 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
     }
 
     try {
+      const payload = await buildPayload();
       const res = await fetch('/v1/public/chat/completions', {
         method: 'POST',
         headers,
@@ -3947,6 +4791,9 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
           }
           try {
             const json = JSON.parse(payload);
+            if (json && json.grok && typeof json.grok === 'object') {
+              applyGrokMetadata(json.grok, targetSessionId);
+            }
             if (json && json.sources && typeof json.sources === 'object') {
               assistantEntry.sources = json.sources;
               if (assistantEntry.row && assistantEntry.row.querySelector('.message-actions')) {
@@ -4039,6 +4886,43 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
       });
     }
     document.addEventListener('click', (event) => {
+      const eventTarget = event.target instanceof Element ? event.target : null;
+      const agentButton = eventTarget ? eventTarget.closest('.think-agent') : null;
+      const stackToggle = eventTarget ? eventTarget.closest('.think-agent-stack-toggle, .think-agent-stack-label') : null;
+      const agentPopover = eventTarget ? eventTarget.closest('.think-agent-popover') : null;
+      if (stackToggle) {
+        event.preventDefault();
+        event.stopPropagation();
+        const stack = stackToggle.closest('.think-agent-stack');
+        if (stack) {
+          const expanded = stack.getAttribute('data-expanded') === 'true';
+          if (expanded) {
+            stack.removeAttribute('data-expanded');
+          } else {
+            stack.setAttribute('data-expanded', 'true');
+          }
+        }
+        return;
+      }
+      if (agentButton) {
+        const scroller = agentButton.closest('.think-agents');
+        if (scroller && scroller.dataset.dragging === '1') {
+          event.preventDefault();
+          event.stopPropagation();
+          return;
+        }
+        event.preventDefault();
+        event.stopPropagation();
+        if (agentButton.getAttribute('data-active') === 'true') {
+          closeThinkAgentPopover();
+        } else {
+          openThinkAgentPopover(agentButton);
+        }
+        return;
+      }
+      if (!agentPopover) {
+        closeThinkAgentPopover();
+      }
       if (modelPicker && !modelPicker.contains(event.target)) {
         closeModelPicker();
       }
@@ -4047,6 +4931,33 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
         return;
       }
       toggleSettings(false);
+    });
+    window.addEventListener('resize', () => {
+      syncSidebarLayer();
+      closeThinkAgentPopover();
+      if (modelPicker && modelPicker.classList.contains('open')) {
+        positionModelPickerMenu();
+      }
+    });
+    document.addEventListener('pointerdown', (event) => {
+      const eventTarget = event.target instanceof Element ? event.target : null;
+      const scroller = eventTarget ? eventTarget.closest('.think-agents') : null;
+      if (scroller) {
+        startThinkAgentsDrag(scroller, event);
+      }
+    });
+    document.addEventListener('pointermove', moveThinkAgentsDrag);
+    document.addEventListener('pointerup', endThinkAgentsDrag);
+    document.addEventListener('pointercancel', endThinkAgentsDrag);
+    document.addEventListener('keydown', (event) => {
+      const agent = event.target instanceof Element ? event.target.closest('.think-agent') : null;
+      if (!agent || (event.key !== 'Enter' && event.key !== ' ')) return;
+      event.preventDefault();
+      if (agent.getAttribute('data-active') === 'true') {
+        closeThinkAgentPopover();
+      } else {
+        openThinkAgentPopover(agent);
+      }
     });
     if (promptInput) {
       let composing = false;
@@ -4248,6 +5159,7 @@ import { StreamRenderer } from '../src/chat/stream_renderer.js';
   updateRangeValues();
   setSendingState(false);
   bindEvents();
+  syncSidebarLayer();
   restoreSidebarState();
   loadSessions();
   loadModels();

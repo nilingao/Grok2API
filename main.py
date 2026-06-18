@@ -78,7 +78,8 @@ async def lifespan(app: FastAPI):
     if refresh_enabled:
         basic_interval = get_config("token.refresh_interval_hours", 8)
         super_interval = get_config("token.super_refresh_interval_hours", 2)
-        interval = min(basic_interval, super_interval)
+        heavy_interval = get_config("token.heavy_refresh_interval_hours", 2)
+        interval = min(basic_interval, super_interval, heavy_interval)
         scheduler = get_scheduler(interval)
         scheduler.start()
 
@@ -96,7 +97,49 @@ async def lifespan(app: FastAPI):
         })
 
     from app.services.cf_refresh import start as cf_refresh_start
+    from app.services.cf_refresh import wait_for_initial_cf_refresh
+
     cf_refresh_start()
+
+    from app.services.statsig_refresh import start as statsig_refresh_start
+    statsig_refresh_start()
+
+    needs_startup_cf = bool(get_config("proxy.enabled", False)) or (
+        get_config("cloakbrowser.enabled", False)
+        and get_config("cloakbrowser.cf_before_probe", True)
+    )
+    if needs_startup_cf:
+        cf_ready = await wait_for_initial_cf_refresh(
+            timeout=float(get_config("proxy.timeout", 60) or 60) + 60.0
+        )
+        if not cf_ready:
+            logger.warning("启动时 CF clearance 未就绪，CloakBrowser probe 将按需自行刷新")
+
+    if get_config("cloakbrowser.enabled", False):
+        try:
+            from app.services.browser_bridge import ensure_bridge_dependencies
+
+            await ensure_bridge_dependencies()
+        except Exception as exc:
+            logger.error(f"CloakBrowser bridge 依赖自动安装失败: {exc}")
+
+        if get_config("cloakbrowser.keep_bridge_alive", True):
+            try:
+                from app.services.browser_bridge import start as start_browser_bridge
+
+                await start_browser_bridge()
+            except Exception as exc:
+                logger.warning(f"CloakBrowser bridge 常驻启动失败: {exc}")
+
+    if get_config("cloakbrowser.prewarm_on_start", True):
+        from app.services.reverse.browser_bridge import prewarm_browser_sessions
+
+        if get_config("cloakbrowser.prewarm_blocking", True):
+            await prewarm_browser_sessions()
+        else:
+            import asyncio
+
+            asyncio.create_task(prewarm_browser_sessions())
 
     logger.info("Application startup complete.")
     yield
@@ -106,6 +149,12 @@ async def lifespan(app: FastAPI):
 
     from app.services.cf_refresh import stop as cf_refresh_stop
     cf_refresh_stop()
+
+    from app.services.statsig_refresh import stop as statsig_refresh_stop
+    statsig_refresh_stop()
+
+    from app.services.browser_bridge import stop as browser_bridge_stop
+    await browser_bridge_stop()
 
     from app.core.storage import StorageFactory
 
